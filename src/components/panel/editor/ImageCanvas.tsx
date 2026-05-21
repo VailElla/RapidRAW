@@ -44,7 +44,7 @@ interface ImageCanvasProps {
   isStraightenActive: boolean;
   isRotationActive?: boolean;
   maskOverlayUrl: string | null;
-  onGenerateAiMask(id: string | null, start: Coord, end: Coord): void;
+  onGenerateAiMask(id: string | null, start: Coord, end: Coord, prompt?: string, useBox?: boolean): void;
   onLiveMaskPreview?: (previewMaskDef: any) => void;
   onQuickErase(subMaskId: string | null, startPoint: Coord, endpoint: Coord): void;
   onSelectAiSubMask(id: string | null): void;
@@ -427,41 +427,22 @@ const MaskOverlay = memo(
       const { startX, startY, endX, endY } = p;
       if (startX !== undefined && startY !== undefined && endX !== undefined && endY !== undefined) {
         const isPoint = Math.abs(startX - endX) < 1e-6 && Math.abs(startY - endY) < 1e-6;
-        if (isPoint) {
-          return (
-            <Circle
-              x={(startX - cropX) * scale}
-              y={(startY - cropY) * scale}
-              radius={5}
-              stroke={isSelected ? '#0ea5e9' : 'white'}
-              strokeWidth={2}
-              listening={!isToolActive}
-              onClick={handleSelect}
-              onTap={handleSelect}
-              onTouchEnd={handleMaskTouchEnd}
-              onTouchStart={handleMaskTouchStart}
-              onMouseEnter={onMaskMouseEnter}
-              onMouseLeave={onMaskMouseLeave}
-              shadowColor="black"
-              shadowBlur={2}
-              shadowOpacity={0.8}
-            />
-          );
-        } else {
-          return (
-            <Rect
-              height={Math.abs(endY - startY) * scale}
-              onMouseEnter={onMaskMouseEnter}
-              onMouseLeave={onMaskMouseLeave}
-              onTouchEnd={handleMaskTouchEnd}
-              onTouchStart={handleMaskTouchStart}
-              width={Math.abs(endX - startX) * scale}
-              x={(Math.min(startX, endX) - cropX) * scale}
-              y={(Math.min(startY, endY) - cropY) * scale}
-              {...commonProps}
-            />
-          );
-        }
+
+        if (isPoint) return null;
+
+        return (
+          <Rect
+            height={Math.abs(endY - startY) * scale}
+            onMouseEnter={onMaskMouseEnter}
+            onMouseLeave={onMaskMouseLeave}
+            onTouchEnd={handleMaskTouchEnd}
+            onTouchStart={handleMaskTouchStart}
+            width={Math.abs(endX - startX) * scale}
+            x={(Math.min(startX, endX) - cropX) * scale}
+            y={(Math.min(startY, endY) - cropY) * scale}
+            {...commonProps}
+          />
+        );
       }
       return null;
     }
@@ -1672,13 +1653,13 @@ const ImageCanvas = memo(
 
         const activeId = isMasking ? activeMaskId : activeAiSubMaskId;
 
-        let startPoint = { x: box.start.x / scale + cropX, y: box.start.y / scale + cropY };
-        let endPoint = { x: box.end.x / scale + cropX, y: box.end.y / scale + cropY };
+        const startPoint = { x: box.start.x / scale + cropX, y: box.start.y / scale + cropY };
+        const endPoint = { x: box.end.x / scale + cropX, y: box.end.y / scale + cropY };
 
         const dx = box.end.x - box.start.x;
         const dy = box.end.y - box.start.y;
         if (Math.sqrt(dx * dx + dy * dy) < 5) {
-          endPoint = { x: startPoint.x, y: startPoint.y };
+          return;
         }
 
         if (activeId) {
@@ -1696,7 +1677,7 @@ const ImageCanvas = memo(
         if (activeSubMask?.type === Mask.QuickEraser && onQuickErase) {
           onQuickErase(activeId, startPoint, endPoint);
         } else if (activeSubMask?.type === Mask.AiSubject && onGenerateAiMask) {
-          onGenerateAiMask(activeId, startPoint, endPoint);
+          onGenerateAiMask(activeId, startPoint, endPoint, '', true);
         }
         return;
       }

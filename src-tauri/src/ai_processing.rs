@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use image::imageops::{self, FilterType};
 use image::{
-    DynamicImage, GenericImageView, GrayImage, ImageBuffer, Luma, Rgb, Rgb32FImage, Rgba, RgbaImage,
+    DynamicImage, GenericImageView, GrayImage, Rgb, Rgb32FImage, RgbImage, Rgba, RgbaImage,
 };
 use ndarray::{Array, Array4, IxDyn};
 use ort::session::Session;
@@ -18,13 +18,22 @@ use tauri::Manager;
 use tokenizers::Tokenizer;
 use tokio::sync::Mutex as TokioMutex;
 
-const ENCODER_URL: &str = "https://huggingface.co/CyberTimon/RapidRAW-Models/resolve/main/sam_vit_b_01ec64_encoder.onnx?download=true";
-const DECODER_URL: &str = "https://huggingface.co/CyberTimon/RapidRAW-Models/resolve/main/sam_vit_b_01ec64_decoder.onnx?download=true";
-const ENCODER_FILENAME: &str = "sam_vit_b_01ec64_encoder.onnx";
-const DECODER_FILENAME: &str = "sam_vit_b_01ec64_decoder.onnx";
-const SAM_INPUT_SIZE: u32 = 1024;
-const ENCODER_SHA256: &str = "16ab73d9c824886f0de2938c19df22fb9ec3deebfd0de58e65177e479213d7d1";
-const DECODER_SHA256: &str = "85d0d672cf5b7fe763edcde429e5533e62f674af4b15c7d688b7673b0ef00bf7";
+const SAM3_VISION_URL: &str =
+    "https://huggingface.co/CyberTimon/RapidRAW-Models/resolve/main/sam3_vision.onnx?download=true";
+const SAM3_VISION_FILENAME: &str = "sam3_vision.onnx";
+const SAM3_VISION_SHA256: &str = "da4b6aca84712ec8cb99d775f514db2897de0f9a28a4bab828206d01dacefbe9";
+const SAM3_TEXT_URL: &str =
+    "https://huggingface.co/CyberTimon/RapidRAW-Models/resolve/main/sam3_text.onnx?download=true";
+const SAM3_TEXT_FILENAME: &str = "sam3_text.onnx";
+const SAM3_TEXT_SHA256: &str = "ebd1b0576512e088a666c644d44b61f85bfe91537e99a025b1166c6b23085c1d";
+const SAM3_DECODER_URL: &str = "https://huggingface.co/CyberTimon/RapidRAW-Models/resolve/main/sam3_decoder.onnx?download=true";
+const SAM3_DECODER_FILENAME: &str = "sam3_decoder.onnx";
+const SAM3_DECODER_SHA256: &str =
+    "0215dd748a5efed1a5af8dc894667cba47aad9d74ad949bfbfd11352bf654d03";
+const SAM3_TOKENIZER_URL: &str =
+    "https://huggingface.co/CyberTimon/RapidRAW-Models/raw/main/sam3_tokenizer.json?download=true";
+const SAM3_TOKENIZER_FILENAME: &str = "sam3_tokenizer.json";
+const SAM3_INPUT_SIZE: u32 = 1008;
 
 const U2NETP_URL: &str =
     "https://huggingface.co/CyberTimon/RapidRAW-Models/resolve/main/u2net.onnx?download=true";
@@ -59,8 +68,10 @@ const DEPTH_INPUT_SIZE: u32 = 518;
 const DEPTH_SHA256: &str = "d2b11a11c1d4a12b47608fa65a17ee9a4c605b55ee1730c8e3b526304f2562be";
 
 pub struct AiModels {
-    pub sam_encoder: Mutex<Session>,
-    pub sam_decoder: Mutex<Session>,
+    pub sam3_vision: Mutex<Session>,
+    pub sam3_text: Mutex<Session>,
+    pub sam3_decoder: Mutex<Session>,
+    pub sam3_tokenizer: Tokenizer,
     pub u2netp: Mutex<Session>,
     pub sky_seg: Mutex<Session>,
     pub depth_anything: Mutex<Session>,
@@ -74,7 +85,10 @@ pub struct ClipModels {
 #[derive(Clone)]
 pub struct ImageEmbeddings {
     pub path_hash: String,
-    pub embeddings: Array<f32, IxDyn>,
+    pub fpn_feat_0: Array<f32, IxDyn>,
+    pub fpn_feat_1: Array<f32, IxDyn>,
+    pub fpn_feat_2: Array<f32, IxDyn>,
+    pub fpn_pos_2: Array<f32, IxDyn>,
     pub original_size: (u32, u32),
 }
 
@@ -92,74 +106,6 @@ pub struct AiState {
     pub lama_model: Option<Arc<Mutex<Session>>>,
     pub embeddings: Option<ImageEmbeddings>,
     pub depth_map: Option<CachedDepthMap>,
-}
-
-fn edt_1d(f: &mut [f32], v: &mut [usize], z: &mut [f32], d: &mut [f32]) {
-    let n = f.len();
-    if n == 0 {
-        return;
-    }
-    let mut k = 0;
-    v[0] = 0;
-    z[0] = f32::NEG_INFINITY;
-    z[1] = f32::INFINITY;
-    for q in 1..n {
-        let mut s = ((f[q] + (q * q) as f32) - (f[v[k]] + (v[k] * v[k]) as f32))
-            / (2.0 * (q as f32 - v[k] as f32));
-        while s <= z[k] {
-            if k == 0 {
-                break;
-            }
-            k -= 1;
-            s = ((f[q] + (q * q) as f32) - (f[v[k]] + (v[k] * v[k]) as f32))
-                / (2.0 * (q as f32 - v[k] as f32));
-        }
-        k += 1;
-        v[k] = q;
-        z[k] = s;
-        z[k + 1] = f32::INFINITY;
-    }
-    k = 0;
-    for (q, d_q) in d[..n].iter_mut().enumerate() {
-        while z[k + 1] < q as f32 {
-            k += 1;
-        }
-        let diff = q as f32 - v[k] as f32;
-        *d_q = diff * diff + f[v[k]];
-    }
-    f.copy_from_slice(&d[..n]);
-}
-
-fn edt_2d(grid: &[bool], width: usize, height: usize) -> Vec<f32> {
-    let area = width * height;
-    let mut f = vec![0.0; area];
-    for i in 0..area {
-        f[i] = if grid[i] { 1e10 } else { 0.0 };
-    }
-
-    let max_dim = width.max(height);
-    let mut v = vec![0; max_dim];
-    let mut z = vec![0.0; max_dim + 1];
-    let mut d = vec![0.0; max_dim];
-
-    for y in 0..height {
-        let start = y * width;
-        let end = start + width;
-        edt_1d(&mut f[start..end], &mut v, &mut z, &mut d);
-    }
-
-    let mut col = vec![0.0; height];
-    for x in 0..width {
-        for y in 0..height {
-            col[y] = f[y * width + x];
-        }
-        edt_1d(&mut col, &mut v, &mut z, &mut d);
-        for y in 0..height {
-            f[y * width + x] = col[y];
-        }
-    }
-
-    f.into_iter().map(|v| v.sqrt()).collect()
 }
 
 fn get_models_dir(app_handle: &tauri::AppHandle) -> Result<PathBuf> {
@@ -181,6 +127,9 @@ async fn download_model(url: &str, dest: &Path) -> Result<()> {
 fn verify_sha256(path: &Path, expected_hash: &str) -> Result<bool> {
     if !path.exists() {
         return Ok(false);
+    }
+    if expected_hash.is_empty() {
+        return Ok(true);
     }
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
@@ -257,19 +206,28 @@ pub async fn get_or_init_ai_models(
     download_and_verify_model(
         app_handle,
         &models_dir,
-        ENCODER_FILENAME,
-        ENCODER_URL,
-        ENCODER_SHA256,
-        "SAM Encoder",
+        SAM3_VISION_FILENAME,
+        SAM3_VISION_URL,
+        SAM3_VISION_SHA256,
+        "SAM3 Vision",
     )
     .await?;
     download_and_verify_model(
         app_handle,
         &models_dir,
-        DECODER_FILENAME,
-        DECODER_URL,
-        DECODER_SHA256,
-        "SAM Decoder",
+        SAM3_TEXT_FILENAME,
+        SAM3_TEXT_URL,
+        SAM3_TEXT_SHA256,
+        "SAM3 Text",
+    )
+    .await?;
+    download_and_verify_model(
+        app_handle,
+        &models_dir,
+        SAM3_DECODER_FILENAME,
+        SAM3_DECODER_URL,
+        SAM3_DECODER_SHA256,
+        "SAM3 Decoder",
     )
     .await?;
     download_and_verify_model(
@@ -300,16 +258,28 @@ pub async fn get_or_init_ai_models(
     )
     .await?;
 
+    let tokenizer_path = models_dir.join(SAM3_TOKENIZER_FILENAME);
+    if !tokenizer_path.exists() {
+        let _ = app_handle.emit("ai-model-download-start", "SAM3 Tokenizer");
+        download_model(SAM3_TOKENIZER_URL, &tokenizer_path).await?;
+        let _ = app_handle.emit("ai-model-download-finish", "SAM3 Tokenizer");
+    }
+
     let _ = ort::init().with_name("AI").commit();
 
-    let encoder_path = models_dir.join(ENCODER_FILENAME);
-    let decoder_path = models_dir.join(DECODER_FILENAME);
+    let sam3_vision_path = models_dir.join(SAM3_VISION_FILENAME);
+    let sam3_text_path = models_dir.join(SAM3_TEXT_FILENAME);
+    let sam3_decoder_path = models_dir.join(SAM3_DECODER_FILENAME);
     let u2netp_path = models_dir.join(U2NETP_FILENAME);
     let sky_seg_path = models_dir.join(SKYSEG_FILENAME);
     let depth_path = models_dir.join(DEPTH_FILENAME);
 
-    let sam_encoder = Session::builder()?.commit_from_file(encoder_path)?;
-    let sam_decoder = Session::builder()?.commit_from_file(decoder_path)?;
+    let sam3_vision = Session::builder()?.commit_from_file(sam3_vision_path)?;
+    let sam3_text = Session::builder()?.commit_from_file(sam3_text_path)?;
+    let sam3_decoder = Session::builder()?.commit_from_file(sam3_decoder_path)?;
+    let sam3_tokenizer =
+        Tokenizer::from_file(tokenizer_path).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
     let u2netp = Session::builder()?.commit_from_file(u2netp_path)?;
     let sky_seg = Session::builder()?.commit_from_file(sky_seg_path)?;
     let depth_anything = Session::builder()?.commit_from_file(depth_path)?;
@@ -317,8 +287,10 @@ pub async fn get_or_init_ai_models(
     crate::register_exit_handler();
 
     let models = Arc::new(AiModels {
-        sam_encoder: Mutex::new(sam_encoder),
-        sam_decoder: Mutex::new(sam_decoder),
+        sam3_vision: Mutex::new(sam3_vision),
+        sam3_text: Mutex::new(sam3_text),
+        sam3_decoder: Mutex::new(sam3_decoder),
+        sam3_tokenizer,
         u2netp: Mutex::new(u2netp),
         sky_seg: Mutex::new(sky_seg),
         depth_anything: Mutex::new(depth_anything),
@@ -530,6 +502,236 @@ pub async fn get_or_init_lama_model(
     }
 
     Ok(lama_model)
+}
+
+fn box_filter_f32(data: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
+    let mut temp = vec![0.0; w * h];
+    let mut out = vec![0.0; w * h];
+
+    for y in 0..h {
+        let offset = y * w;
+        for x in 0..w {
+            let min_x = x.saturating_sub(r);
+            let max_x = (x + r).min(w - 1);
+            let mut sum = 0.0;
+            for xi in min_x..=max_x {
+                sum += data[offset + xi];
+            }
+            temp[offset + x] = sum / (max_x - min_x + 1) as f32;
+        }
+    }
+    for x in 0..w {
+        for y in 0..h {
+            let min_y = y.saturating_sub(r);
+            let max_y = (y + r).min(h - 1);
+            let mut sum = 0.0;
+            for yi in min_y..=max_y {
+                sum += temp[yi * w + x];
+            }
+            out[y * w + x] = sum / (max_y - min_y + 1) as f32;
+        }
+    }
+    out
+}
+
+fn resize_f32_bilinear(
+    src: &[f32],
+    src_w: usize,
+    src_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+) -> Vec<f32> {
+    let mut dst = vec![0.0; dst_w * dst_h];
+    let x_ratio = (src_w as f32 - 1.0) / (dst_w as f32 - 1.0).max(1.0);
+    let y_ratio = (src_h as f32 - 1.0) / (dst_h as f32 - 1.0).max(1.0);
+
+    for y in 0..dst_h {
+        let src_y = y as f32 * y_ratio;
+        let y_lo = src_y.floor() as usize;
+        let y_hi = (y_lo + 1).min(src_h - 1);
+        let y_weight = src_y - y_lo as f32;
+
+        let row_lo = y_lo * src_w;
+        let row_hi = y_hi * src_w;
+        let dst_row = y * dst_w;
+
+        for x in 0..dst_w {
+            let src_x = x as f32 * x_ratio;
+            let x_lo = src_x.floor() as usize;
+            let x_hi = (x_lo + 1).min(src_w - 1);
+            let x_weight = src_x - x_lo as f32;
+
+            let tl = src[row_lo + x_lo];
+            let tr = src[row_lo + x_hi];
+            let bl = src[row_hi + x_lo];
+            let br = src[row_hi + x_hi];
+
+            let top = tl + (tr - tl) * x_weight;
+            let bottom = bl + (br - bl) * x_weight;
+            dst[dst_row + x] = top + (bottom - top) * y_weight;
+        }
+    }
+    dst
+}
+
+pub fn fast_color_guided_filter(
+    high_res_guide: &RgbImage,
+    low_res_mask: &GrayImage,
+    r: usize,
+    eps: f32,
+    sharpen_k: f32,
+    midpoint: f32,
+) -> GrayImage {
+    let (w_high, h_high) = high_res_guide.dimensions();
+    let (w_low, h_low) = low_res_mask.dimensions();
+
+    let low_res_guide = imageops::resize(high_res_guide, w_low, h_low, FilterType::Triangle);
+
+    let wl = w_low as usize;
+    let hl = h_low as usize;
+    let num_pixels = wl * hl;
+
+    let mut ir = vec![0.0; num_pixels];
+    let mut ig = vec![0.0; num_pixels];
+    let mut ib = vec![0.0; num_pixels];
+    let mut p = vec![0.0; num_pixels];
+
+    for (i, (pix_g, pix_m)) in low_res_guide
+        .pixels()
+        .zip(low_res_mask.pixels())
+        .enumerate()
+    {
+        ir[i] = pix_g[0] as f32 / 255.0;
+        ig[i] = pix_g[1] as f32 / 255.0;
+        ib[i] = pix_g[2] as f32 / 255.0;
+        p[i] = pix_m[0] as f32 / 255.0;
+    }
+
+    let p_high = resize_f32_bilinear(&p, wl, hl, w_high as usize, h_high as usize);
+
+    let mean_ir = box_filter_f32(&ir, wl, hl, r);
+    let mean_ig = box_filter_f32(&ig, wl, hl, r);
+    let mean_ib = box_filter_f32(&ib, wl, hl, r);
+    let mean_p = box_filter_f32(&p, wl, hl, r);
+
+    let mut var_rr = vec![0.0; num_pixels];
+    let mut var_rg = vec![0.0; num_pixels];
+    let mut var_rb = vec![0.0; num_pixels];
+    let mut var_gg = vec![0.0; num_pixels];
+    let mut var_gb = vec![0.0; num_pixels];
+    let mut var_bb = vec![0.0; num_pixels];
+
+    let mut cov_rp = vec![0.0; num_pixels];
+    let mut cov_gp = vec![0.0; num_pixels];
+    let mut cov_bp = vec![0.0; num_pixels];
+
+    for i in 0..num_pixels {
+        var_rr[i] = ir[i] * ir[i];
+        var_rg[i] = ir[i] * ig[i];
+        var_rb[i] = ir[i] * ib[i];
+        var_gg[i] = ig[i] * ig[i];
+        var_gb[i] = ig[i] * ib[i];
+        var_bb[i] = ib[i] * ib[i];
+
+        cov_rp[i] = ir[i] * p[i];
+        cov_gp[i] = ig[i] * p[i];
+        cov_bp[i] = ib[i] * p[i];
+    }
+
+    let mean_rr = box_filter_f32(&var_rr, wl, hl, r);
+    let mean_rg = box_filter_f32(&var_rg, wl, hl, r);
+    let mean_rb = box_filter_f32(&var_rb, wl, hl, r);
+    let mean_gg = box_filter_f32(&var_gg, wl, hl, r);
+    let mean_gb = box_filter_f32(&var_gb, wl, hl, r);
+    let mean_bb = box_filter_f32(&var_bb, wl, hl, r);
+
+    let mean_rp = box_filter_f32(&cov_rp, wl, hl, r);
+    let mean_gp = box_filter_f32(&cov_gp, wl, hl, r);
+    let mean_bp = box_filter_f32(&cov_bp, wl, hl, r);
+
+    let mut a_r = vec![0.0; num_pixels];
+    let mut a_g = vec![0.0; num_pixels];
+    let mut a_b = vec![0.0; num_pixels];
+    let mut b = vec![0.0; num_pixels];
+
+    for i in 0..num_pixels {
+        let s00 = mean_rr[i] - mean_ir[i] * mean_ir[i] + eps;
+        let s01 = mean_rg[i] - mean_ir[i] * mean_ig[i];
+        let s02 = mean_rb[i] - mean_ir[i] * mean_ib[i];
+        let s11 = mean_gg[i] - mean_ig[i] * mean_ig[i] + eps;
+        let s12 = mean_gb[i] - mean_ig[i] * mean_ib[i];
+        let s22 = mean_bb[i] - mean_ib[i] * mean_ib[i] + eps;
+
+        let crp = mean_rp[i] - mean_ir[i] * mean_p[i];
+        let cgp = mean_gp[i] - mean_ig[i] * mean_p[i];
+        let cbp = mean_bp[i] - mean_ib[i] * mean_p[i];
+
+        let det = s00 * (s11 * s22 - s12 * s12) - s01 * (s01 * s22 - s12 * s02)
+            + s02 * (s01 * s12 - s11 * s02);
+
+        if det.abs() > 1e-10 {
+            let inv00 = (s11 * s22 - s12 * s12) / det;
+            let inv01 = (s02 * s12 - s01 * s22) / det;
+            let inv02 = (s01 * s12 - s11 * s02) / det;
+            let inv11 = (s00 * s22 - s02 * s02) / det;
+            let inv12 = (s01 * s02 - s00 * s12) / det;
+            let inv22 = (s00 * s11 - s01 * s01) / det;
+
+            a_r[i] = inv00 * crp + inv01 * cgp + inv02 * cbp;
+            a_g[i] = inv01 * crp + inv11 * cgp + inv12 * cbp;
+            a_b[i] = inv02 * crp + inv12 * cgp + inv22 * cbp;
+        } else {
+            a_r[i] = 0.0;
+            a_g[i] = 0.0;
+            a_b[i] = 0.0;
+        }
+
+        b[i] = mean_p[i] - (a_r[i] * mean_ir[i] + a_g[i] * mean_ig[i] + a_b[i] * mean_ib[i]);
+    }
+
+    let wh = w_high as usize;
+    let hh = h_high as usize;
+
+    let a_r_high = resize_f32_bilinear(&a_r, wl, hl, wh, hh);
+    let a_g_high = resize_f32_bilinear(&a_g, wl, hl, wh, hh);
+    let a_b_high = resize_f32_bilinear(&a_b, wl, hl, wh, hh);
+    let b_high = resize_f32_bilinear(&b, wl, hl, wh, hh);
+
+    let mut out_mask = GrayImage::new(w_high, h_high);
+
+    let sig = |x: f32| -> f32 { 1.0 / (1.0 + (-sharpen_k * (x - midpoint)).exp()) };
+    let v_min = if sharpen_k > 0.0 { sig(0.0) } else { 0.0 };
+    let v_max = if sharpen_k > 0.0 { sig(1.0) } else { 1.0 };
+    let v_range = (v_max - v_min).max(1e-6);
+
+    for y in 0..hh {
+        let y_guide = y as u32;
+        for x in 0..wh {
+            let idx = y * wh + x;
+            let p_rgb = high_res_guide.get_pixel(x as u32, y_guide);
+            let ir_h = p_rgb[0] as f32 / 255.0;
+            let ig_h = p_rgb[1] as f32 / 255.0;
+            let ib_h = p_rgb[2] as f32 / 255.0;
+
+            let q =
+                a_r_high[idx] * ir_h + a_g_high[idx] * ig_h + a_b_high[idx] * ib_h + b_high[idx];
+            let q_clamped = q.clamp(0.0, 1.0);
+
+            let q_sharp = if sharpen_k > 0.0 {
+                (sig(q_clamped) - v_min) / v_range
+            } else {
+                q_clamped
+            };
+
+            let envelope = p_high[idx].clamp(0.0, 1.0);
+
+            let q_final = q_sharp * envelope;
+            let q_u8 = (q_final * 255.0).clamp(0.0, 255.0) as u8;
+            out_mask.put_pixel(x as u32, y_guide, image::Luma([q_u8]));
+        }
+    }
+
+    out_mask
 }
 
 #[derive(Clone, Copy)]
@@ -917,275 +1119,268 @@ pub fn run_lama_inpainting(
 
 pub fn generate_image_embeddings(
     image: &DynamicImage,
-    encoder: &Mutex<Session>,
+    sam3_vision: &Mutex<Session>,
 ) -> Result<ImageEmbeddings> {
     let (orig_width, orig_height) = image.dimensions();
 
     let long_side = orig_width.max(orig_height) as f32;
-    let scale = SAM_INPUT_SIZE as f32 / long_side;
+    let scale = SAM3_INPUT_SIZE as f32 / long_side;
     let new_width = (orig_width as f32 * scale).round() as u32;
     let new_height = (orig_height as f32 * scale).round() as u32;
 
-    let resized_image = image.resize(new_width, new_height, FilterType::Triangle);
+    let resized_image = image.resize_exact(new_width, new_height, FilterType::Triangle);
     let rgb_image = resized_image.into_rgb8();
     let (actual_width, actual_height) = rgb_image.dimensions();
     let raw_pixels = rgb_image.as_raw();
 
-    let mut input_tensor: Array<u8, _> =
-        Array::zeros((1, 3, SAM_INPUT_SIZE as usize, SAM_INPUT_SIZE as usize));
+    let mut input_tensor: Array<f32, _> =
+        Array::zeros((1, 3, SAM3_INPUT_SIZE as usize, SAM3_INPUT_SIZE as usize));
+
+    let mean = [0.485, 0.456, 0.406];
+    let std = [0.229, 0.224, 0.225];
 
     let w_usize = actual_width as usize;
     for y in 0..(actual_height as usize) {
         for x in 0..w_usize {
             let idx = (y * w_usize + x) * 3;
-            input_tensor[[0, 0, y, x]] = raw_pixels[idx];
-            input_tensor[[0, 1, y, x]] = raw_pixels[idx + 1];
-            input_tensor[[0, 2, y, x]] = raw_pixels[idx + 2];
+            input_tensor[[0, 0, y, x]] = ((raw_pixels[idx] as f32 / 255.0) - mean[0]) / std[0];
+            input_tensor[[0, 1, y, x]] = ((raw_pixels[idx + 1] as f32 / 255.0) - mean[1]) / std[1];
+            input_tensor[[0, 2, y, x]] = ((raw_pixels[idx + 2] as f32 / 255.0) - mean[2]) / std[2];
         }
     }
 
     let input_tensor_dyn = input_tensor.into_dyn();
     let input_values = input_tensor_dyn.as_standard_layout();
     let input_tensor_ort = Tensor::from_array(input_values.into_owned())?;
-    let mut session = encoder.lock().unwrap();
-    let outputs = session.run(ort::inputs![input_tensor_ort])?;
 
-    let embeddings = outputs[0].try_extract_array::<f32>()?.to_owned();
+    let mut session = sam3_vision.lock().unwrap();
+    let outputs = session.run(ort::inputs![input_tensor_ort])?;
 
     Ok(ImageEmbeddings {
         path_hash: "".to_string(),
-        embeddings: embeddings.into_dyn(),
+        fpn_feat_0: outputs[0].try_extract_array::<f32>()?.to_owned().into_dyn(),
+        fpn_feat_1: outputs[1].try_extract_array::<f32>()?.to_owned().into_dyn(),
+        fpn_feat_2: outputs[2].try_extract_array::<f32>()?.to_owned().into_dyn(),
+        fpn_pos_2: outputs[3].try_extract_array::<f32>()?.to_owned().into_dyn(),
         original_size: (orig_width, orig_height),
     })
 }
 
-pub fn run_sam_decoder(
+pub fn run_sam3_decoder(
+    sam3_text: &Mutex<Session>,
     decoder: &Mutex<Session>,
+    tokenizer: &Tokenizer,
     embeddings: &ImageEmbeddings,
+    text_prompt: &str,
+    use_box: bool,
     start_point: (f64, f64),
     end_point: (f64, f64),
+    high_res_guide: &DynamicImage,
 ) -> Result<GrayImage> {
     let (orig_width, orig_height) = embeddings.original_size;
-    let long_side = orig_width.max(orig_height) as f64;
-    let scale = SAM_INPUT_SIZE as f64 / long_side;
 
-    let iters = 2;
-
-    let is_point =
-        (start_point.0 - end_point.0).abs() < 1e-6 && (start_point.1 - end_point.1).abs() < 1e-6;
-    let mut point_coords = Vec::new();
-    let mut point_labels = Vec::new();
-
-    if is_point {
-        point_coords.push((
-            (start_point.0 * scale) as f32,
-            (start_point.1 * scale) as f32,
-        ));
-        point_labels.push(1.0f32);
+    let clean_prompt = text_prompt.trim();
+    let dynamic_prompt = if clean_prompt.is_empty() {
+        "visual object"
     } else {
-        let x1 = (start_point.0.min(end_point.0) * scale) as f32;
-        let y1 = (start_point.1.min(end_point.1) * scale) as f32;
-        let x2 = (start_point.0.max(end_point.0) * scale) as f32;
-        let y2 = (start_point.1.max(end_point.1) * scale) as f32;
-        point_coords.push((x1, y1));
-        point_coords.push((x2, y2));
-        point_labels.push(2.0f32);
-        point_labels.push(3.0f32);
-    }
+        clean_prompt
+    };
 
-    let mut mask_input = Array::zeros((1, 1, 256, 256)).into_dyn();
-    let mut has_mask_input = 0.0f32;
+    let encoding = tokenizer
+        .encode(dynamic_prompt, true)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let mut ids = encoding.get_ids().to_vec();
+    let mut mask = encoding.get_attention_mask().to_vec();
 
-    let orig_im_size =
-        Array::from_shape_vec((2,), vec![orig_height as f32, orig_width as f32])?.into_dyn();
+    ids.resize(32, 0);
+    mask.resize(32, 0);
 
-    let mut final_mask_data: Vec<u8> = Vec::new();
-    let mut final_w = 0;
-    let mut final_h = 0;
+    let ids_arr = Array::from_shape_vec((1, 32), ids.into_iter().map(|i| i as i64).collect())?;
+    let mask_arr = Array::from_shape_vec((1, 32), mask.into_iter().map(|m| m as i64).collect())?;
 
-    for i in 0..iters {
-        let pc_len = point_coords.len();
-        let pl_len = point_labels.len();
+    let t_ids = Tensor::from_array(ids_arr.into_dyn().as_standard_layout().into_owned())?;
+    let t_mask = Tensor::from_array(mask_arr.into_dyn().as_standard_layout().into_owned())?;
 
-        let coords_flat: Vec<f32> = point_coords.iter().flat_map(|&(x, y)| vec![x, y]).collect();
-        let coords_array = Array::from_shape_vec((1, pc_len, 2), coords_flat)?.into_dyn();
-        let labels_array = Array::from_shape_vec((1, pl_len), point_labels.clone())?.into_dyn();
+    let (text_features, text_out_mask) = {
+        let mut session = sam3_text.lock().unwrap();
+        let text_outputs = session.run(ort::inputs![t_ids, t_mask])?;
 
-        let t_embeddings = Tensor::from_array(
-            embeddings
-                .embeddings
-                .clone()
-                .as_standard_layout()
-                .into_owned(),
-        )?;
-        let t_point_coords = Tensor::from_array(coords_array.as_standard_layout().into_owned())?;
-        let t_point_labels = Tensor::from_array(labels_array.as_standard_layout().into_owned())?;
-        let t_mask_input =
-            Tensor::from_array(mask_input.clone().as_standard_layout().into_owned())?;
-        let t_has_mask = Tensor::from_array(
-            Array::from_elem((1,), has_mask_input)
-                .into_dyn()
-                .as_standard_layout()
-                .into_owned(),
-        )?;
-        let t_orig_im_size =
-            Tensor::from_array(orig_im_size.clone().as_standard_layout().into_owned())?;
-
-        let mask_tensor = {
-            let mut session = decoder.lock().unwrap();
-            let outputs = session.run(ort::inputs![
-                t_embeddings,
-                t_point_coords,
-                t_point_labels,
-                t_mask_input,
-                t_has_mask,
-                t_orig_im_size
-            ])?;
-            outputs[0].try_extract_array::<f32>()?.to_owned()
+        let f = if let Ok(feat) = text_outputs[0].try_extract_array::<f32>() {
+            feat.to_owned().into_dyn()
+        } else {
+            anyhow::bail!("Failed to extract text_features");
         };
 
-        let mask_dims = mask_tensor.shape();
-        let h = mask_dims[2];
-        let w = mask_dims[3];
-        let area = h * w;
+        let m = if let Ok(m_bool) = text_outputs[1].try_extract_array::<bool>() {
+            m_bool.to_owned().into_dyn()
+        } else if let Ok(m_f32) = text_outputs[1].try_extract_array::<f32>() {
+            m_f32.mapv(|x| x != 0.0).into_dyn()
+        } else if let Ok(m_i64) = text_outputs[1].try_extract_array::<i64>() {
+            m_i64.mapv(|x| x != 0).into_dyn()
+        } else {
+            anyhow::bail!("Failed to extract text_mask");
+        };
 
-        let mask_slice = mask_tensor.as_slice().unwrap();
-        let first_mask_slice = &mask_slice[0..area];
+        (f, m)
+    };
 
-        if i == iters - 1 {
-            final_mask_data = first_mask_slice
-                .iter()
-                .map(|&val| if val > 0.0 { 255 } else { 0 })
-                .collect();
-            final_w = w;
-            final_h = h;
-            break;
+    let (boxes, labels) = if use_box {
+        let rx1 = start_point.0.min(end_point.0).clamp(0.0, orig_width as f64);
+        let ry1 = start_point
+            .1
+            .min(end_point.1)
+            .clamp(0.0, orig_height as f64);
+        let rx2 = start_point.0.max(end_point.0).clamp(0.0, orig_width as f64);
+        let ry2 = start_point
+            .1
+            .max(end_point.1)
+            .clamp(0.0, orig_height as f64);
+
+        let rw = rx2 - rx1;
+        let rh = ry2 - ry1;
+
+        let rcx = rx1 + rw / 2.0;
+        let rcy = ry1 + rh / 2.0;
+
+        let cx = (rcx / orig_width as f64) as f32;
+        let cy = (rcy / orig_height as f64) as f32;
+        let nw = (rw / orig_width as f64) as f32;
+        let nh = (rh / orig_height as f64) as f32;
+
+        (
+            Array::from_shape_vec((1, 1, 4), vec![cx, cy, nw, nh])?,
+            Array::from_shape_vec((1, 1), vec![1_i64])?,
+        )
+    } else {
+        (
+            Array::from_shape_vec((1, 1, 4), vec![0.0, 0.0, 0.0, 0.0])?,
+            Array::from_shape_vec((1, 1), vec![-10_i64])?,
+        )
+    };
+
+    let t_fpn_0 = Tensor::from_array(
+        embeddings
+            .fpn_feat_0
+            .clone()
+            .as_standard_layout()
+            .into_owned(),
+    )?;
+    let t_fpn_1 = Tensor::from_array(
+        embeddings
+            .fpn_feat_1
+            .clone()
+            .as_standard_layout()
+            .into_owned(),
+    )?;
+    let t_fpn_2 = Tensor::from_array(
+        embeddings
+            .fpn_feat_2
+            .clone()
+            .as_standard_layout()
+            .into_owned(),
+    )?;
+    let t_fpn_pos_2 = Tensor::from_array(
+        embeddings
+            .fpn_pos_2
+            .clone()
+            .as_standard_layout()
+            .into_owned(),
+    )?;
+    let t_text_feat = Tensor::from_array(text_features.as_standard_layout().into_owned())?;
+    let t_text_mask = Tensor::from_array(text_out_mask.as_standard_layout().into_owned())?;
+    let t_boxes = Tensor::from_array(boxes.into_dyn().as_standard_layout().into_owned())?;
+    let t_labels = Tensor::from_array(labels.into_dyn().as_standard_layout().into_owned())?;
+
+    let (masks, logits, presence) = {
+        let mut session = decoder.lock().unwrap();
+        let decoder_outputs = session.run(ort::inputs![
+            t_fpn_0,
+            t_fpn_1,
+            t_fpn_2,
+            t_fpn_pos_2,
+            t_text_feat,
+            t_text_mask,
+            t_boxes,
+            t_labels
+        ])?;
+
+        let m = decoder_outputs[0].try_extract_array::<f32>()?.to_owned();
+        let l = decoder_outputs[2].try_extract_array::<f32>()?.to_owned();
+        let p = decoder_outputs[3].try_extract_array::<f32>()?.to_owned();
+
+        (m, l, p)
+    };
+
+    let logits_slice = logits.as_slice().unwrap();
+    let presence_slice = presence.as_slice().unwrap();
+
+    let mut best_idx = 0;
+    let mut best_score = f32::MIN;
+
+    let p_score = 1.0 / (1.0 + (-presence_slice[0]).exp());
+    for i in 0..logits_slice.len() {
+        let score = (1.0 / (1.0 + (-logits_slice[i]).exp())) * p_score;
+        if score > best_score {
+            best_score = score;
+            best_idx = i;
         }
-
-        let mut binary_mask = vec![false; area];
-        let mut mask_area = 0.0;
-        let mut min_x = w;
-        let mut min_y = h;
-        let mut max_x = 0;
-        let mut max_y = 0;
-
-        for (idx, &val) in first_mask_slice.iter().enumerate() {
-            if val > 0.0 {
-                binary_mask[idx] = true;
-                let x = idx % w;
-                let y = idx / w;
-                min_x = min_x.min(x);
-                max_x = max_x.max(x);
-                min_y = min_y.min(y);
-                max_y = max_y.max(y);
-                mask_area += 1.0;
-            }
-        }
-
-        if mask_area == 0.0 || min_x > max_x {
-            final_mask_data = first_mask_slice
-                .iter()
-                .map(|&val| if val > 0.0 { 255 } else { 0 })
-                .collect();
-            final_w = w;
-            final_h = h;
-            break;
-        }
-
-        let dt_in = edt_2d(&binary_mask, w, h);
-        let mut max_in = 0.0;
-        let mut pos_idx = 0;
-        for (idx, &v) in dt_in.iter().enumerate() {
-            if v > max_in {
-                max_in = v;
-                pos_idx = idx;
-            }
-        }
-        let pos_y = pos_idx / w;
-        let pos_x = pos_idx % w;
-
-        let mut rev_mask = vec![false; area];
-        for (idx, is_true) in binary_mask.iter().enumerate() {
-            rev_mask[idx] = !is_true;
-        }
-        let mut dt_out = edt_2d(&rev_mask, w, h);
-
-        for y in 0..h {
-            for x in 0..w {
-                if x < min_x || x > max_x || y < min_y || y > max_y {
-                    dt_out[y * w + x] = 0.0;
-                }
-            }
-        }
-
-        let mut max_out = 0.0;
-        let mut neg_idx = 0;
-        for (idx, &v) in dt_out.iter().enumerate() {
-            if v > max_out {
-                max_out = v;
-                neg_idx = idx;
-            }
-        }
-        let neg_y = neg_idx / w;
-        let neg_x = neg_idx % w;
-
-        point_coords.clear();
-        point_labels.clear();
-
-        point_coords.push(((pos_x as f64 * scale) as f32, (pos_y as f64 * scale) as f32));
-        point_labels.push(1.0);
-        point_coords.push(((neg_x as f64 * scale) as f32, (neg_y as f64 * scale) as f32));
-        point_labels.push(0.0);
-        point_coords.push(((min_x as f64 * scale) as f32, (min_y as f64 * scale) as f32));
-        point_labels.push(2.0);
-        point_coords.push(((max_x as f64 * scale) as f32, (max_y as f64 * scale) as f32));
-        point_labels.push(3.0);
-
-        let mut gaus_dt = vec![0.0f32; area];
-        let variance = (mask_area / 4.0_f32).max(1.0_f32);
-        for (idx, &is_true) in binary_mask.iter().enumerate() {
-            if is_true {
-                let diff = dt_in[idx] - max_in;
-                gaus_dt[idx] = (-(diff * diff) / variance).exp();
-            }
-        }
-
-        let mask_f32_vec: Vec<f32> = first_mask_slice
-            .iter()
-            .map(|&v| if v > 0.0 { 15.0 } else { -15.0 })
-            .collect();
-
-        let img_mask_f32 =
-            ImageBuffer::<Luma<f32>, Vec<f32>>::from_raw(w as u32, h as u32, mask_f32_vec).unwrap();
-        let img_gaus_f32 =
-            ImageBuffer::<Luma<f32>, Vec<f32>>::from_raw(w as u32, h as u32, gaus_dt).unwrap();
-
-        let resized_mask = imageops::resize(&img_mask_f32, 256, 256, FilterType::Triangle);
-        let resized_gaus = imageops::resize(&img_gaus_f32, 256, 256, FilterType::Triangle);
-
-        let rm_raw = resized_mask.as_raw();
-        let rg_raw = resized_gaus.as_raw();
-        let mut mask_input_flat = vec![0.0f32; 256 * 256];
-
-        for i in 0..(256 * 256) {
-            let m_val = rm_raw[i];
-            let mut g_val = rg_raw[i];
-            if g_val <= 0.0 {
-                g_val = 1.0;
-            }
-            mask_input_flat[i] = m_val * g_val;
-        }
-
-        mask_input = Array::from_shape_vec((1, 1, 256, 256), mask_input_flat)
-            .unwrap()
-            .into_dyn();
-        has_mask_input = 1.0;
     }
 
-    let gray_mask = GrayImage::from_raw(final_w as u32, final_h as u32, final_mask_data)
-        .ok_or_else(|| anyhow::anyhow!("Failed to create mask image from raw data"))?;
+    let mask_dims = masks.shape();
+    let h = mask_dims[2] as usize;
+    let w = mask_dims[3] as usize;
 
-    let feathered_mask = image::imageops::blur(&gray_mask, 2.0);
+    let masks_4d = masks
+        .into_dimensionality::<ndarray::Ix4>()
+        .map_err(|e| anyhow::anyhow!("Expected 4D mask array: {}", e))?;
+
+    let mask_view = masks_4d.slice(ndarray::s![0, best_idx, .., ..]);
+    let mut mask_data = Vec::with_capacity(h * w);
+    for val in mask_view.iter() {
+        let prob = 1.0 / (1.0 + (-val).exp());
+        mask_data.push((prob * 255.0).clamp(0.0, 255.0) as u8);
+    }
+
+    let mask_img = GrayImage::from_raw(w as u32, h as u32, mask_data)
+        .ok_or_else(|| anyhow::anyhow!("Failed to create mask"))?;
+
+    let long_side_u32 = orig_width.max(orig_height);
+    let valid_w = ((orig_width as f64 / long_side_u32 as f64) * w as f64).round() as u32;
+    let valid_h = ((orig_height as f64 / long_side_u32 as f64) * h as f64).round() as u32;
+
+    let low_res_cropped =
+        imageops::crop_imm(&mask_img, 0, 0, valid_w.max(1), valid_h.max(1)).to_image();
+
+    let smoothed_low_res = image::imageops::blur(&low_res_cropped, 1.5);
+
+    let guide_rgb = high_res_guide.to_rgb8();
+    let dynamic_radius = (orig_width.max(orig_height) / 200).max(8) as usize;
+
+    let mut final_mask = fast_color_guided_filter(
+        &guide_rgb,
+        &smoothed_low_res,
+        dynamic_radius,
+        1e-3,
+        2.5,
+        0.50,
+    );
+
+    let mut lut = [0u8; 256];
+    for i in 0..=255 {
+        if i <= 8 {
+            lut[i] = 0;
+        } else if i >= 247 {
+            lut[i] = 255;
+        } else {
+            lut[i] = (((i as f32 - 8.0) / (247.0 - 8.0)) * 255.0).round() as u8;
+        }
+    }
+
+    for p in final_mask.pixels_mut() {
+        p[0] = lut[p[0] as usize];
+    }
+
+    let feathered_mask = image::imageops::blur(&final_mask, 1.0);
 
     Ok(feathered_mask)
 }
@@ -1194,8 +1389,6 @@ pub fn run_sky_seg_model(
     image: &DynamicImage,
     sky_seg_session: &Mutex<Session>,
 ) -> Result<GrayImage> {
-    let (orig_width, orig_height) = image.dimensions();
-
     let resized_image = image.resize(SKYSEG_INPUT_SIZE, SKYSEG_INPUT_SIZE, FilterType::Triangle);
     let (resized_w, resized_h) = resized_image.dimensions();
     let resized_rgb = resized_image.into_rgb8();
@@ -1266,7 +1459,29 @@ pub fn run_sky_seg_model(
     let cropped_mask = GrayImage::from_raw(resized_w, resized_h, cropped_mask_data)
         .ok_or_else(|| anyhow::anyhow!("Failed to create mask from Sky Segmentation output"))?;
 
-    let final_mask = imageops::resize(&cropped_mask, orig_width, orig_height, FilterType::Triangle);
+    let smoothed_mask = image::imageops::blur(&cropped_mask, 1.5);
+
+    let guide_rgb = image.to_rgb8();
+    let (w, h) = image.dimensions();
+    let dynamic_radius = (w.max(h) / 200).max(8) as usize;
+
+    let mut final_mask =
+        fast_color_guided_filter(&guide_rgb, &smoothed_mask, dynamic_radius, 1e-3, 2.5, 0.50);
+
+    let mut lut = [0u8; 256];
+    for i in 0..=255 {
+        if i <= 8 {
+            lut[i] = 0;
+        } else if i >= 247 {
+            lut[i] = 255;
+        } else {
+            lut[i] = (((i as f32 - 8.0) / (247.0 - 8.0)) * 255.0).round() as u8;
+        }
+    }
+
+    for p in final_mask.pixels_mut() {
+        p[0] = lut[p[0] as usize];
+    }
 
     Ok(final_mask)
 }
@@ -1275,8 +1490,6 @@ pub fn run_u2netp_model(
     image: &DynamicImage,
     u2netp_session: &Mutex<Session>,
 ) -> Result<GrayImage> {
-    let (orig_width, orig_height) = image.dimensions();
-
     let resized_image = image.resize(U2NETP_INPUT_SIZE, U2NETP_INPUT_SIZE, FilterType::Triangle);
     let (resized_w, resized_h) = resized_image.dimensions();
     let resized_rgb = resized_image.into_rgb8();
@@ -1347,7 +1560,29 @@ pub fn run_u2netp_model(
     let cropped_mask = GrayImage::from_raw(resized_w, resized_h, cropped_mask_data)
         .ok_or_else(|| anyhow::anyhow!("Failed to create mask from U-2-Netp output"))?;
 
-    let final_mask = imageops::resize(&cropped_mask, orig_width, orig_height, FilterType::Triangle);
+    let smoothed_mask = image::imageops::blur(&cropped_mask, 1.5);
+
+    let guide_rgb = image.to_rgb8();
+    let (w, h) = image.dimensions();
+    let dynamic_radius = (w.max(h) / 200).max(8) as usize;
+
+    let mut final_mask =
+        fast_color_guided_filter(&guide_rgb, &smoothed_mask, dynamic_radius, 1e-3, 2.5, 0.50);
+
+    let mut lut = [0u8; 256];
+    for i in 0..=255 {
+        if i <= 8 {
+            lut[i] = 0;
+        } else if i >= 247 {
+            lut[i] = 255;
+        } else {
+            lut[i] = (((i as f32 - 8.0) / (247.0 - 8.0)) * 255.0).round() as u8;
+        }
+    }
+
+    for p in final_mask.pixels_mut() {
+        p[0] = lut[p[0] as usize];
+    }
 
     Ok(final_mask)
 }
@@ -1438,6 +1673,10 @@ pub fn run_depth_anything_model(
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AiSubjectMaskParameters {
+    #[serde(default)]
+    pub text_prompt: String,
+    #[serde(default)]
+    pub use_box: bool,
     pub start_x: f64,
     pub start_y: f64,
     pub end_x: f64,

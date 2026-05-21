@@ -13,7 +13,7 @@ use crate::ai_connector;
 use crate::ai_processing::{
     self, AiDepthMaskParameters, AiForegroundMaskParameters, AiSkyMaskParameters,
     AiSubjectMaskParameters, CachedDepthMap, generate_image_embeddings, get_or_init_ai_models,
-    run_depth_anything_model, run_sam_decoder, run_sky_seg_model, run_u2netp_model,
+    run_depth_anything_model, run_sam3_decoder, run_sky_seg_model, run_u2netp_model,
 };
 use crate::app_settings::load_settings;
 use crate::app_state::AppState;
@@ -189,6 +189,8 @@ pub async fn generate_ai_depth_mask(
 pub async fn generate_ai_subject_mask(
     js_adjustments: serde_json::Value,
     path: String,
+    text_prompt: String,
+    use_box: bool,
     start_point: (f64, f64),
     end_point: (f64, f64),
     rotation: f32,
@@ -216,6 +218,8 @@ pub async fn generate_ai_subject_mask(
         hasher.finalize().to_hex().to_string()
     };
 
+    let warped_image = get_cached_full_warped_image(&state, &js_adjustments)?;
+
     let embeddings = {
         let mut ai_state_lock = state.ai_state.lock().unwrap();
         let ai_state = ai_state_lock.as_mut().unwrap();
@@ -224,18 +228,16 @@ pub async fn generate_ai_subject_mask(
             if cached_embeddings.path_hash == path_hash {
                 cached_embeddings.clone()
             } else {
-                let warped_image = get_cached_full_warped_image(&state, &js_adjustments)?;
                 let mut new_embeddings =
-                    generate_image_embeddings(warped_image.as_ref(), &models.sam_encoder)
+                    generate_image_embeddings(warped_image.as_ref(), &models.sam3_vision)
                         .map_err(|e| e.to_string())?;
                 new_embeddings.path_hash = path_hash.clone();
                 ai_state.embeddings = Some(new_embeddings.clone());
                 new_embeddings
             }
         } else {
-            let warped_image = get_cached_full_warped_image(&state, &js_adjustments)?;
             let mut new_embeddings =
-                generate_image_embeddings(warped_image.as_ref(), &models.sam_encoder)
+                generate_image_embeddings(warped_image.as_ref(), &models.sam3_vision)
                     .map_err(|e| e.to_string())?;
             new_embeddings.path_hash = path_hash.clone();
             ai_state.embeddings = Some(new_embeddings.clone());
@@ -315,16 +317,23 @@ pub async fn generate_ai_subject_mask(
     let unrotated_start_point = (min_x, min_y);
     let unrotated_end_point = (max_x, max_y);
 
-    let mask_bitmap = run_sam_decoder(
-        &models.sam_decoder,
+    let mask_bitmap = run_sam3_decoder(
+        &models.sam3_text,
+        &models.sam3_decoder,
+        &models.sam3_tokenizer,
         &embeddings,
+        &text_prompt,
+        use_box,
         unrotated_start_point,
         unrotated_end_point,
+        warped_image.as_ref(),
     )
     .map_err(|e| e.to_string())?;
     let base64_data = encode_to_base64_png(&mask_bitmap)?;
 
     Ok(AiSubjectMaskParameters {
+        text_prompt,
+        use_box,
         start_x: start_point.0,
         start_y: start_point.1,
         end_x: end_point.0,
@@ -372,7 +381,7 @@ pub async fn precompute_ai_subject_mask(
     }
 
     let warped_image = get_cached_full_warped_image(&state, &js_adjustments)?;
-    let mut new_embeddings = generate_image_embeddings(warped_image.as_ref(), &models.sam_encoder)
+    let mut new_embeddings = generate_image_embeddings(warped_image.as_ref(), &models.sam3_vision)
         .map_err(|e| e.to_string())?;
 
     new_embeddings.path_hash = path_hash.clone();

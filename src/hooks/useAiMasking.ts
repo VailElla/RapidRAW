@@ -128,19 +128,22 @@ export function useAiMasking() {
         const transformAdjustments = getTransformAdjustments(adjustments);
         const newMaskParams: any = await invoke(Invokes.GenerateAiSubjectMask, {
           jsAdjustments: transformAdjustments,
+          path: selectedImage.path,
+          textPrompt: '', // Quick erase relies purely on the box
+          useBox: true,
+          startPoint: [startPoint.x, startPoint.y],
           endPoint: [endPoint.x, endPoint.y],
           flipHorizontal: adjustments.flipHorizontal,
           flipVertical: adjustments.flipVertical,
           orientationSteps: adjustments.orientationSteps,
-          path: selectedImage.path,
           rotation: adjustments.rotation,
-          startPoint: [startPoint.x, startPoint.y],
         });
 
         const subMaskToUpdate = adjustments.aiPatches
           ?.find((p: AiPatch) => p.id === patchId)
           ?.subMasks.find((sm: SubMask) => sm.id === subMaskId);
         const finalSubMaskParams: any = { ...subMaskToUpdate?.parameters, ...newMaskParams };
+
         const updatedAdjustmentsForBackend = {
           ...adjustments,
           aiPatches: adjustments.aiPatches.map((p: AiPatch) =>
@@ -234,32 +237,49 @@ export function useAiMasking() {
     [setAdjustments],
   );
 
-  const handleGenerateAiMask = async (subMaskId: string, startPoint: Coord, endPoint: Coord) => {
+  const handleGenerateAiMask = async (
+    subMaskId: string,
+    startPoint: Coord,
+    endPoint: Coord,
+    prompt: string = '',
+    useBox: boolean = true,
+  ) => {
     const { selectedImage, adjustments, patchesSentToBackend } = useEditorStore.getState();
     if (!selectedImage?.path) return;
+
     setEditor({ isGeneratingAiMask: true });
 
     try {
       const transformAdjustments = getTransformAdjustments(adjustments);
       const newParameters = await invoke(Invokes.GenerateAiSubjectMask, {
         jsAdjustments: transformAdjustments,
+        path: selectedImage.path,
+        textPrompt: prompt,
+        useBox: useBox,
+        startPoint: [startPoint.x, startPoint.y],
         endPoint: [endPoint.x, endPoint.y],
         flipHorizontal: adjustments.flipHorizontal,
         flipVertical: adjustments.flipVertical,
         orientationSteps: adjustments.orientationSteps,
-        path: selectedImage.path,
         rotation: adjustments.rotation,
-        startPoint: [startPoint.x, startPoint.y],
       });
 
-      const subMask = adjustments.aiPatches
-        ?.flatMap((p: AiPatch) => p.subMasks)
-        .find((sm: SubMask) => sm.id === subMaskId);
-      const mergedParameters = { ...(subMask?.parameters || {}), ...newParameters };
+      const subMask =
+        adjustments.aiPatches?.flatMap((p: AiPatch) => p.subMasks).find((sm: SubMask) => sm.id === subMaskId) ||
+        adjustments.masks?.flatMap((m: MaskContainer) => m.subMasks).find((sm: SubMask) => sm.id === subMaskId);
+
+      const mergedParameters = { ...(subMask?.parameters || {}), ...newParameters, prompt };
       patchesSentToBackend.delete(subMaskId);
-      updateSubMask(subMaskId, { parameters: mergedParameters });
+
+      const updatePayload: any = { parameters: mergedParameters };
+      if (!useBox && prompt.trim()) {
+        updatePayload.name = prompt.trim();
+      }
+
+      updateSubMask(subMaskId, updatePayload);
     } catch (error) {
       toast.error(`AI Mask Failed: ${error}`);
+      console.error(`AI Mask Failed: ${error}`);
     } finally {
       setEditor({ isGeneratingAiMask: false });
     }

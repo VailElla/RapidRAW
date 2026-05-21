@@ -1294,9 +1294,23 @@ export default function Editor({ onBackToLibrary, onContextMenu, transformWrappe
     const subMasks = activeMaskDef.subMasks?.map((sm: any) => {
       const { parameters, ...rest } = sm;
       const cleanParams = { ...parameters };
+
+      const maskDataFingerprint = cleanParams.mask_data_base64
+        ? `${cleanParams.mask_data_base64.length}-${cleanParams.mask_data_base64.slice(-20)}`
+        : null;
+      const maskDataCamelFingerprint = cleanParams.maskDataBase64
+        ? `${cleanParams.maskDataBase64.length}-${cleanParams.maskDataBase64.slice(-20)}`
+        : null;
+
       delete cleanParams.mask_data_base64;
       delete cleanParams.maskDataBase64;
-      return { ...rest, parameters: cleanParams };
+
+      return {
+        ...rest,
+        parameters: cleanParams,
+        _maskDataFingerprint: maskDataFingerprint,
+        _maskDataCamelFingerprint: maskDataCamelFingerprint,
+      };
     });
 
     return JSON.stringify({

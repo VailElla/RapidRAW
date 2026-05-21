@@ -39,6 +39,7 @@ import {
   RotateCcw,
   Trash2,
   SwatchBook,
+  Wand2,
   SquaresIntersect,
 } from 'lucide-react';
 
@@ -52,6 +53,8 @@ import DetailsPanel from '../../adjustments/Details';
 import EffectsPanel from '../../adjustments/Effects';
 import Waveform from '../editor/Waveform';
 import Resizer from '../../ui/Resizer';
+import Input from '../../ui/Input';
+import Button from '../../ui/Button';
 
 import {
   Mask,
@@ -547,7 +550,8 @@ function DepthRangePicker({
 
 export default function MasksPanel() {
   const { setAdjustments } = useEditorActions();
-  const { handleGenerateAiDepthMask, handleGenerateAiForegroundMask, handleGenerateAiSkyMask } = useAiMasking();
+  const { handleGenerateAiDepthMask, handleGenerateAiForegroundMask, handleGenerateAiSkyMask, handleGenerateAiMask } =
+    useAiMasking();
   const setCustomEscapeHandler = useUIStore((s) => s.setCustomEscapeHandler);
   const { appSettings } = useSettingsStore(
     useShallow((state) => ({
@@ -1450,6 +1454,7 @@ export default function MasksPanel() {
                   setSettingsSectionOpen={setSettingsSectionOpen}
                   presets={presets}
                   handleGenerateAiDepthMask={handleGenerateAiDepthMask}
+                  handleGenerateAiMask={handleGenerateAiMask}
                 />
               </motion.div>
             )}
@@ -2129,6 +2134,7 @@ function SettingsPanel({
   setSettingsSectionOpen,
   presets,
   handleGenerateAiDepthMask,
+  handleGenerateAiMask,
 }: any) {
   const { showContextMenu } = useContextMenu();
   const isActive = !!container;
@@ -2343,6 +2349,45 @@ function SettingsPanel({
         isContentVisible={true}
       >
         <div className="space-y-4 pt-2">
+          {isComponentMode && activeSubMask.type === Mask.AiSubject && (
+            <div className="space-y-3 mb-4 pb-4 border-b border-surface">
+              <Text variant={TextVariants.small}>
+                Describe the subject below, OR draw a box directly on the canvas to auto-select.
+              </Text>
+              <Input
+                autoFocus
+                className="w-full"
+                placeholder="e.g., a car, person, dog..."
+                value={activeSubMask.parameters?.prompt || ''}
+                disabled={_isGeneratingAiMask}
+                onChange={(e: any) =>
+                  updateSubMask(activeSubMask.id, {
+                    parameters: { ...activeSubMask.parameters, prompt: e.target.value },
+                  })
+                }
+                onKeyDown={(e: any) => {
+                  if (e.key === 'Enter') {
+                    const promptText = activeSubMask.parameters?.prompt || '';
+                    if (promptText.trim()) {
+                      handleGenerateAiMask(activeSubMask.id, { x: 0, y: 0 }, { x: 0, y: 0 }, promptText, false);
+                    }
+                  }
+                }}
+              />
+              <Button
+                className="w-full"
+                disabled={_isGeneratingAiMask || !activeSubMask.parameters?.prompt?.trim()}
+                onClick={() => {
+                  const promptText = activeSubMask.parameters?.prompt || '';
+                  handleGenerateAiMask(activeSubMask.id, { x: 0, y: 0 }, { x: 0, y: 0 }, promptText, false);
+                }}
+              >
+                {_isGeneratingAiMask ? <Loader2 size={16} className="animate-spin" /> : <Wand2 size={16} />}
+                <span className="ml-2">{_isGeneratingAiMask ? 'Generating...' : 'Generate from Prompt'}</span>
+              </Button>
+            </div>
+          )}
+
           <Switch
             checked={!!(isComponentMode ? activeSubMask.invert : displayContainer.invert)}
             label={isComponentMode ? 'Invert Component' : 'Invert Mask'}
