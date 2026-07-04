@@ -5,7 +5,7 @@ use crate::image_loader::load_base_image_from_bytes;
 use crate::image_processing::{
     apply_cpu_default_raw_processing, apply_linear_to_srgb, apply_srgb_to_linear,
 };
-use crate::panorama_stitching::{Feature, KeyPoint};
+use crate::panorama_stitching::{Feature, KeyPoint, Match};
 use crate::panorama_utils::{processing, stitching};
 use image::{DynamicImage, GenericImageView, GrayImage, Rgb32FImage};
 use nalgebra::{Matrix3, Point2};
@@ -18,6 +18,14 @@ pub type HdrFrame = (String, DynamicImage, Duration, f32);
 
 const DEGHOST_FAST_THRESHOLD: u8 = 8;
 const DEGHOST_NON_MAXIMA_SUPPRESSION_RADIUS: f32 = 8.0;
+const DEGHOST_MAX_PROCESSING_DIMENSION: u32 = 3200;
+const DEGHOST_IDENTITY_MAX_DISPLACEMENT: f64 = 1.0;
+
+enum AlignmentOutcome {
+    Warped(Rgb32FImage),
+    AlreadyAligned,
+    Failed,
+}
 
 struct FrameDetection {
     keypoints: Vec<KeyPoint>,
@@ -126,14 +134,20 @@ pub fn align_hdr_frames(frames: &mut [HdrFrame], app_handle: &AppHandle) {
             .to_string_lossy()
             .into_owned();
         let _ = app_handle.emit("hdr-progress", format!("Aligning '{}'...", file_name));
-        let aligned = align_frame_to_reference(
+        let outcome = align_frame_to_reference(
             &frames[index].1,
             &detections[index],
             &detections[reference_index],
         );
-        match aligned {
-            Some(warped) => frames[index].1 = DynamicImage::ImageRgb32F(warped),
-            None => {
+        match outcome {
+            AlignmentOutcome::Warped(warped) => {
+                println!("[deghost] '{}' warped to reference", file_name);
+                frames[index].1 = DynamicImage::ImageRgb32F(warped);
+            }
+            AlignmentOutcome::AlreadyAligned => {
+                println!("[deghost] '{}' already aligned, skipping warp", file_name);
+            }
+            AlignmentOutcome::Failed => {
                 let _ = app_handle.emit(
                     "hdr-progress",
                     format!("Could not align '{}', using as-is", file_name),
@@ -158,7 +172,11 @@ fn detect_frame_features(
     let gray_full = image::imageops::colorops::grayscale(&detection_proxy.to_rgb8());
     let (width, height) = gray_full.dimensions();
     let (small_width, small_height, scale_factor) =
-        processing::calculate_downscale_dimensions(width, height);
+        processing::calculate_downscale_dimensions_capped(
+            width,
+            height,
+            DEGHOST_MAX_PROCESSING_DIMENSION,
+        );
     let gray_small = image::imageops::resize(
         &gray_full,
         small_width,
@@ -193,7 +211,7 @@ fn align_frame_to_reference(
     frame_image: &DynamicImage,
     frame: &FrameDetection,
     reference: &FrameDetection,
-) -> Option<Rgb32FImage> {
+) -> AlignmentOutcome {
     let matches = processing::match_features(&reference.features, &frame.features);
     println!(
         "[deghost] matches against reference: {} (threshold {})",
@@ -201,44 +219,69 @@ fn align_frame_to_reference(
         processing::MIN_INLIERS_FOR_CONNECTION
     );
     if matches.len() < processing::MIN_INLIERS_FOR_CONNECTION {
-        return None;
+        return AlignmentOutcome::Failed;
     }
     let (_, inliers) =
         match processing::find_homography_ransac(&matches, &reference.keypoints, &frame.keypoints) {
             Some(result) => result,
             None => {
                 println!("[deghost] RANSAC found too few inliers");
-                return None;
+                return AlignmentOutcome::Failed;
             }
         };
     println!("[deghost] inliers: {}", inliers.len());
-    let inlier_points: Vec<(Point2<f64>, Point2<f64>)> = inliers
-        .iter()
-        .map(|m| {
-            let reference_point = reference.keypoints[m.index1];
-            let frame_point = frame.keypoints[m.index2];
-            (
-                Point2::new(reference_point.x as f64, reference_point.y as f64),
-                Point2::new(frame_point.x as f64, frame_point.y as f64),
-            )
-        })
-        .collect();
-    let homography_small = processing::compute_homography(&inlier_points)?;
-    let reference_scale_inverse = scaling_matrix(1.0 / reference.scale_factor);
-    let frame_scale = scaling_matrix(frame.scale_factor);
-    let homography_full = frame_scale * homography_small * reference_scale_inverse;
+    let (dx_small, dy_small) = median_translation(&inliers, reference, frame);
+    let dx_full = dx_small * frame.scale_factor;
+    let dy_full = dy_small * frame.scale_factor;
+    let displacement = (dx_full * dx_full + dy_full * dy_full).sqrt();
+    println!(
+        "[deghost] estimated translation: ({:.2}, {:.2}) px, magnitude {:.2}",
+        dx_full, dy_full, displacement
+    );
+    if displacement < DEGHOST_IDENTITY_MAX_DISPLACEMENT {
+        return AlignmentOutcome::AlreadyAligned;
+    }
+    let translation = translation_matrix(dx_full, dy_full);
     let source = frame_image.to_rgb32f();
     let (width, height) = frame_image.dimensions();
-    Some(stitching::warp_image_homography(
+    AlignmentOutcome::Warped(stitching::warp_image_homography(
         &source,
-        &homography_full,
+        &translation,
         width,
         height,
     ))
 }
 
-fn scaling_matrix(scale: f64) -> Matrix3<f64> {
-    Matrix3::new(scale, 0.0, 0.0, 0.0, scale, 0.0, 0.0, 0.0, 1.0)
+fn median_translation(
+    inliers: &[Match],
+    reference: &FrameDetection,
+    frame: &FrameDetection,
+) -> (f64, f64) {
+    assert!(!inliers.is_empty(), "translation requires inlier matches");
+    let mut horizontal: Vec<f64> = Vec::with_capacity(inliers.len());
+    let mut vertical: Vec<f64> = Vec::with_capacity(inliers.len());
+    for m in inliers {
+        let reference_point = reference.keypoints[m.index1];
+        let frame_point = frame.keypoints[m.index2];
+        horizontal.push(frame_point.x as f64 - reference_point.x as f64);
+        vertical.push(frame_point.y as f64 - reference_point.y as f64);
+    }
+    (median(&mut horizontal), median(&mut vertical))
+}
+
+fn median(values: &mut [f64]) -> f64 {
+    assert!(!values.is_empty(), "median requires at least one value");
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let middle = values.len() / 2;
+    if values.len() % 2 == 0 {
+        (values[middle - 1] + values[middle]) / 2.0
+    } else {
+        values[middle]
+    }
+}
+
+fn translation_matrix(dx: f64, dy: f64) -> Matrix3<f64> {
+    Matrix3::new(1.0, 0.0, dx, 0.0, 1.0, dy, 0.0, 0.0, 1.0)
 }
 
 #[cfg(test)]
@@ -275,8 +318,10 @@ mod align_hdr_frames_tests {
 
         let reference = detect(&reference_image);
         let frame = detect(&shifted_image);
-        let aligned = align_frame_to_reference(&shifted_image, &frame, &reference)
-            .expect("alignment should succeed on textured frame");
+        let aligned = match align_frame_to_reference(&shifted_image, &frame, &reference) {
+            super::AlignmentOutcome::Warped(warped) => warped,
+            _ => panic!("alignment should warp the shifted frame"),
+        };
 
         let reference_pixels = reference_image.to_rgb32f();
         let mut error = 0.0f32;
@@ -290,7 +335,7 @@ mod align_hdr_frames_tests {
     }
 
     #[test]
-    fn returns_none_on_featureless_frame() {
+    fn fails_on_featureless_frame() {
         let flat = DynamicImage::ImageRgb32F(Rgb32FImage::from_pixel(
             160,
             160,
@@ -298,6 +343,20 @@ mod align_hdr_frames_tests {
         ));
         let reference = detect(&textured_frame());
         let frame = detect(&flat);
-        assert!(align_frame_to_reference(&flat, &frame, &reference).is_none());
+        assert!(matches!(
+            align_frame_to_reference(&flat, &frame, &reference),
+            super::AlignmentOutcome::Failed
+        ));
+    }
+
+    #[test]
+    fn skips_warp_when_frame_matches_reference() {
+        let reference_image = textured_frame();
+        let reference = detect(&reference_image);
+        let frame = detect(&reference_image);
+        assert!(matches!(
+            align_frame_to_reference(&reference_image, &frame, &reference),
+            super::AlignmentOutcome::AlreadyAligned
+        ));
     }
 }

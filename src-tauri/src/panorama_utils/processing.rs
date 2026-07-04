@@ -19,11 +19,20 @@ const LOW_DETAIL_WINDOW_RADIUS: u32 = 16;
 const LOW_DETAIL_VARIANCE_THRESHOLD: f64 = 60.0;
 
 pub fn calculate_downscale_dimensions(width: u32, height: u32) -> (u32, u32, f64) {
+    calculate_downscale_dimensions_capped(width, height, MAX_PROCESSING_DIMENSION)
+}
+
+pub fn calculate_downscale_dimensions_capped(
+    width: u32,
+    height: u32,
+    max_dimension: u32,
+) -> (u32, u32, f64) {
+    assert!(max_dimension > 0, "max_dimension must be positive");
     let long_side = width.max(height);
-    if long_side <= MAX_PROCESSING_DIMENSION {
+    if long_side <= max_dimension {
         return (width, height, 1.0);
     }
-    let scale_factor = long_side as f64 / MAX_PROCESSING_DIMENSION as f64;
+    let scale_factor = long_side as f64 / max_dimension as f64;
     let new_width = (width as f64 / scale_factor).round() as u32;
     let new_height = (height as f64 / scale_factor).round() as u32;
     (new_width, new_height, scale_factor)
