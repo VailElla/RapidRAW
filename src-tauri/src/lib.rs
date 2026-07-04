@@ -20,6 +20,7 @@ mod export_processing;
 mod file_management;
 mod formats;
 mod gpu_processing;
+mod hdr_deghosting;
 mod image_loader;
 mod image_processing;
 mod lens_correction;
@@ -40,7 +41,7 @@ use std::hash::{Hash, Hasher};
 use std::io::Cursor;
 use std::io::Write;
 use std::panic;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -71,16 +72,14 @@ use crate::cache_utils::{
     DecodedImageCache, GEOMETRY_KEYS, calculate_full_job_hash, calculate_geometry_hash,
     calculate_transform_hash, calculate_visual_hash,
 };
-use crate::exif_processing::{read_exposure_time_secs, read_iso};
 use crate::file_management::{parse_virtual_path, read_file_mapped};
 use crate::formats::is_raw_file;
-use crate::image_loader::{
-    composite_patches_on_image, load_and_composite, load_base_image_from_bytes,
-};
+use crate::hdr_deghosting::{align_hdr_frames, assert_uniform_dimensions, load_hdr_frames};
+use crate::image_loader::{composite_patches_on_image, load_and_composite};
 use crate::image_processing::{
     Crop, GeometryParams, RenderRequest, apply_coarse_rotation, apply_cpu_default_raw_processing,
-    apply_flip, apply_geometry_warp, apply_linear_to_srgb, apply_srgb_to_linear,
-    downscale_f32_image, get_all_adjustments_from_json, get_or_init_gpu_context,
+    apply_flip, apply_geometry_warp, apply_linear_to_srgb, downscale_f32_image,
+    get_all_adjustments_from_json, get_or_init_gpu_context,
     process_and_get_dynamic_image, resolve_tonemapper_override,
     resolve_tonemapper_override_from_handle, warp_image_geometry,
 };
@@ -1391,69 +1390,11 @@ async fn merge_hdr(
     let hdr_result_handle = state.hdr_result.clone();
     let settings = load_settings(app_handle.clone()).unwrap_or_default();
 
-    let loaded_items: Vec<(String, DynamicImage, Duration, f32)> = paths
-        .iter()
-        .map(|path| {
-            let _ = app_handle.emit(
-                "hdr-progress",
-                format!(
-                    "Processing '{}'",
-                    Path::new(path)
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                ),
-            );
+    let mut frames = load_hdr_frames(&paths, &app_handle, &settings)?;
+    assert_uniform_dimensions(&frames)?;
+    align_hdr_frames(&mut frames, &app_handle);
 
-            let file_bytes =
-                fs::read(path).map_err(|e| format!("Failed to read image {}: {}", path, e))?;
-            let mut dynamic_image =
-                load_base_image_from_bytes(&file_bytes, path, false, &settings, None)
-                    .map_err(|e| format!("Failed to load image {}: {}", path, e))?;
-
-            if !crate::formats::is_raw_file(path) {
-                dynamic_image = apply_srgb_to_linear(dynamic_image);
-            }
-
-            let gains = match read_iso(path, &file_bytes) {
-                None => return Err(format!("Image {} is missing ISO/Sensitivity data", path)),
-                Some(gains) => gains as f32,
-            };
-
-            let exposure = match read_exposure_time_secs(path, &file_bytes) {
-                None => return Err(format!("Image {} is missing ExposureTime data", path)),
-                Some(exp) => Duration::from_secs_f32(exp),
-            };
-
-            Ok((path.clone(), dynamic_image, exposure, gains))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-
-    if let Some((first_path, first_img, _, _)) = loaded_items.first() {
-        let (width, height) = (first_img.width(), first_img.height());
-
-        for (path, img, _, _) in loaded_items.iter().skip(1) {
-            if img.width() != width || img.height() != height {
-                return Err(format!(
-                    "Dimension mismatch detected.\n\nBase image ({}): {}x{}\nTarget image ({}): {}x{}\n\nHDR merge requires all images to be exactly the same size.",
-                    Path::new(first_path)
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy(),
-                    width,
-                    height,
-                    Path::new(path)
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy(),
-                    img.width(),
-                    img.height()
-                ));
-            }
-        }
-    }
-
-    let images: Vec<HDRInput> = loaded_items
+    let images: Vec<HDRInput> = frames
         .iter()
         .map(|(path, img, exposure, gains)| {
             HDRInput::with_image(img, *exposure, *gains)
