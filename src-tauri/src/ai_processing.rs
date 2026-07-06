@@ -34,6 +34,7 @@ const U2NETP_SHA256: &str = "8d10d2f3bb75ae3b6d527c77944fc5e7dcd94b29809d47a739a
 
 const SKYSEG_URL: &str = "https://huggingface.co/CyberTimon/RapidRAW-Models/resolve/main/skyseg-u2net.onnx?download=true";
 const SKYSEG_FILENAME: &str = "skyseg_u2net.onnx";
+const SKYSEG_LEGACY_FILENAME: &str = "skyseg-u2net.onnx";
 const SKYSEG_INPUT_SIZE: u32 = 320;
 const SKYSEG_SHA256: &str = "ab9c34c64c3d821220a2886a4a06da4642ffa14d5b30e8d5339056a089aa1d39";
 
@@ -235,6 +236,32 @@ fn verify_sha256(path: &Path, expected_hash: &str) -> Result<bool> {
     Ok(hex_hash == expected_hash)
 }
 
+fn promote_legacy_model_filename(
+    models_dir: &Path,
+    expected_filename: &str,
+    legacy_filename: &str,
+    expected_hash: &str,
+) -> Result<()> {
+    let expected_path = models_dir.join(expected_filename);
+    if expected_path.exists() {
+        return Ok(());
+    }
+
+    let legacy_path = models_dir.join(legacy_filename);
+    if !legacy_path.exists() || !verify_sha256(&legacy_path, expected_hash)? {
+        return Ok(());
+    }
+
+    fs::rename(&legacy_path, &expected_path).or_else(|rename_error| -> std::io::Result<()> {
+        if expected_path.exists() {
+            Ok(())
+        } else {
+            Err(rename_error)
+        }
+    })?;
+    Ok(())
+}
+
 async fn download_and_verify_model(
     app_handle: &tauri::AppHandle,
     models_dir: &Path,
@@ -244,6 +271,14 @@ async fn download_and_verify_model(
     model_name: &str,
 ) -> Result<()> {
     let dest_path = models_dir.join(filename);
+    if filename == SKYSEG_FILENAME {
+        promote_legacy_model_filename(
+            models_dir,
+            SKYSEG_FILENAME,
+            SKYSEG_LEGACY_FILENAME,
+            SKYSEG_SHA256,
+        )?;
+    }
     let is_valid = verify_sha256(&dest_path, expected_hash)?;
 
     if !is_valid {
@@ -1477,7 +1512,8 @@ pub fn run_depth_anything_model(
 
 #[cfg(test)]
 mod tests {
-    use super::persist_downloaded_asset;
+    use super::{persist_downloaded_asset, promote_legacy_model_filename};
+    use sha2::{Digest, Sha256};
 
     #[test]
     fn persist_downloaded_asset_rejects_empty_download_without_final_file() {
@@ -1499,6 +1535,46 @@ mod tests {
 
         assert_eq!(std::fs::read(&dest).unwrap(), b"model-bytes");
         assert!(!dest.with_file_name(".model.onnx.download").exists());
+    }
+
+    #[test]
+    fn promote_legacy_model_filename_renames_valid_legacy_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let expected = temp_dir.path().join("skyseg_u2net.onnx");
+        let legacy = temp_dir.path().join("skyseg-u2net.onnx");
+        let bytes = b"model-bytes";
+        std::fs::write(&legacy, bytes).unwrap();
+        let expected_hash = hex::encode(Sha256::digest(bytes));
+
+        promote_legacy_model_filename(
+            temp_dir.path(),
+            "skyseg_u2net.onnx",
+            "skyseg-u2net.onnx",
+            &expected_hash,
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read(expected).unwrap(), bytes);
+        assert!(!legacy.exists());
+    }
+
+    #[test]
+    fn promote_legacy_model_filename_ignores_invalid_legacy_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let expected = temp_dir.path().join("skyseg_u2net.onnx");
+        let legacy = temp_dir.path().join("skyseg-u2net.onnx");
+        std::fs::write(&legacy, b"wrong-bytes").unwrap();
+
+        promote_legacy_model_filename(
+            temp_dir.path(),
+            "skyseg_u2net.onnx",
+            "skyseg-u2net.onnx",
+            "definitely-not-this-hash",
+        )
+        .unwrap();
+
+        assert!(!expected.exists());
+        assert!(legacy.exists());
     }
 }
 
