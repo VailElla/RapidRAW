@@ -96,6 +96,7 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
 
     setEditor({ adjustments: INITIAL_ADJUSTMENTS });
     resetHistory(INITIAL_ADJUSTMENTS);
+    useEditorStore.getState().patchesSentToBackend.clear();
 
     isBackendReadyRef.current = true;
     setEditor((state) => {
@@ -112,6 +113,7 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
 
       if (selectedImage?.path === path) return;
 
+      useEditorStore.getState().patchesSentToBackend.clear();
       debouncedSave.flush();
       debouncedSetHistory.cancel();
 
@@ -324,6 +326,7 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
           setEditor({ selectedImage: null, finalPreviewUrl: null, uncroppedAdjustedPreviewUrl: null, histogram: null });
           setEditor({ adjustments: INITIAL_ADJUSTMENTS });
           resetHistory(INITIAL_ADJUSTMENTS);
+          useEditorStore.getState().patchesSentToBackend.clear();
         }
 
         const command =
