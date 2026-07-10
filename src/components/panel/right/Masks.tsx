@@ -12,6 +12,8 @@ import {
   TriangleRight,
   User,
   Sun,
+  Stamp,
+  Bandage,
 } from 'lucide-react';
 import i18n from 'i18next';
 
@@ -28,6 +30,8 @@ export enum Mask {
   Luminance = 'luminance',
   QuickEraser = 'quick-eraser',
   Radial = 'radial',
+  Clone = 'clone',
+  Heal = 'heal',
 }
 
 export enum SubMaskMode {
@@ -64,25 +68,27 @@ export interface SubMask {
 }
 
 export function formatMaskTypeName(type: string) {
-  if (type === Mask.AiDepth) return i18n.t('masks.types.depth');
-  if (type === Mask.AiSubject) return i18n.t('masks.types.subject');
-  if (type === Mask.AiForeground) return i18n.t('masks.types.foreground');
-  if (type === Mask.AiSky) return i18n.t('masks.types.sky');
-  if (type === Mask.All) return i18n.t('masks.types.all');
-  if (type === Mask.QuickEraser) return i18n.t('masks.types.quickEraser');
-  if (type === Mask.Brush) return i18n.t('masks.types.brush');
-  if (type === Mask.Flow) return i18n.t('masks.types.flow');
-  if (type === Mask.Color) return i18n.t('masks.types.color');
-  if (type === Mask.Linear) return i18n.t('masks.types.linear');
-  if (type === Mask.Luminance) return i18n.t('masks.types.luminance');
-  if (type === Mask.Radial) return i18n.t('masks.types.radial');
+  if (type === Mask.AiDepth) return i18n.t('masks.types.depth', 'Depth');
+  if (type === Mask.AiSubject) return i18n.t('masks.types.subject', 'Subject');
+  if (type === Mask.AiForeground) return i18n.t('masks.types.foreground', 'Foreground');
+  if (type === Mask.AiSky) return i18n.t('masks.types.sky', 'Sky');
+  if (type === Mask.All) return i18n.t('masks.types.all', 'Whole Image');
+  if (type === Mask.QuickEraser) return i18n.t('masks.types.quickEraser', 'Quick Erase');
+  if (type === Mask.Brush) return i18n.t('masks.types.brush', 'Brush');
+  if (type === Mask.Flow) return i18n.t('masks.types.flow', 'Flow');
+  if (type === Mask.Color) return i18n.t('masks.types.color', 'Color');
+  if (type === Mask.Linear) return i18n.t('masks.types.linear', 'Linear');
+  if (type === Mask.Luminance) return i18n.t('masks.types.luminance', 'Luminance');
+  if (type === Mask.Radial) return i18n.t('masks.types.radial', 'Radial');
+  if (type === Mask.Clone) return i18n.t('masks.types.clone', 'Clone');
+  if (type === Mask.Heal) return i18n.t('masks.types.heal', 'Heal');
   return type.charAt(0).toUpperCase() + type.slice(1);
 }
 
 export function getMaskTypeName(mask: MaskType) {
-  if (mask.id === 'others') return i18n.t('masks.types.others');
+  if (mask.id === 'others') return i18n.t('masks.types.others', 'Others');
   if (mask.type === Mask.QuickEraser && mask.name === 'Quick Erase') {
-    return i18n.t('masks.types.quickErase');
+    return i18n.t('masks.types.quickErase', 'Quick Erase');
   }
   return formatMaskTypeName(mask.type);
 }
@@ -104,6 +110,8 @@ export const MASK_ICON_MAP: Record<Mask, any> = {
   [Mask.Luminance]: Sparkles,
   [Mask.QuickEraser]: Eraser,
   [Mask.Radial]: Circle,
+  [Mask.Clone]: Stamp,
+  [Mask.Heal]: Bandage,
 };
 
 export const MASK_PANEL_CREATION_TYPES: Array<MaskType> = [
@@ -146,7 +154,22 @@ export const MASK_PANEL_CREATION_TYPES: Array<MaskType> = [
   },
 ];
 
-export const AI_PANEL_CREATION_TYPES: Array<MaskType> = [
+export const AI_MANUAL_CLEANUP_TYPES: Array<MaskType> = [
+  {
+    disabled: false,
+    icon: Stamp,
+    name: 'Clone',
+    type: Mask.Clone,
+  },
+  {
+    disabled: false,
+    icon: Bandage,
+    name: 'Heal',
+    type: Mask.Heal,
+  },
+];
+
+export const AI_GENERATIVE_CREATION_TYPES: Array<MaskType> = [
   {
     disabled: false,
     icon: Eraser,
@@ -265,34 +288,6 @@ export const OTHERS_MASK_TYPES: Array<MaskType> = [
 ];
 
 export const AI_SUB_MASK_COMPONENT_TYPES: Array<MaskType> = [
-  {
-    disabled: false,
-    icon: Sparkles,
-    name: 'Subject',
-    type: Mask.AiSubject,
-  },
-  {
-    disabled: false,
-    icon: User,
-    name: 'Foreground',
-    type: Mask.AiForeground,
-  },
-  {
-    disabled: false,
-    icon: Brush,
-    name: 'Brush',
-    type: Mask.Brush,
-  },
-  {
-    disabled: false,
-    icon: TriangleRight,
-    name: 'Linear',
-    type: Mask.Linear,
-  },
-  {
-    disabled: false,
-    icon: Circle,
-    name: 'Radial',
-    type: Mask.Radial,
-  },
+  ...AI_MANUAL_CLEANUP_TYPES,
+  ...AI_GENERATIVE_CREATION_TYPES,
 ];

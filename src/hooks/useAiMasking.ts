@@ -50,6 +50,50 @@ export function useAiMasking() {
     [setAdjustments],
   );
 
+  const handleManualCleanup = useCallback(
+    async (subMaskId: string, sourceX: number, sourceY: number) => {
+      const { selectedImage, adjustments, patchesSentToBackend } = useEditorStore.getState();
+      if (!selectedImage?.path) return;
+
+      const patchId = adjustments.aiPatches.find((p: AiPatch) =>
+        p.subMasks.some((sm: SubMask) => sm.id === subMaskId),
+      )?.id;
+      if (!patchId) return;
+
+      setAdjustments((prev: Partial<Adjustments>) => ({
+        ...prev,
+        aiPatches: prev.aiPatches?.map((p: AiPatch) => (p.id === patchId ? { ...p, isLoading: true } : p)),
+      }));
+
+      try {
+        const patchDefinitionForBackend = adjustments.aiPatches.find((p: AiPatch) => p.id === patchId);
+
+        const newPatchDataJson: any = await invoke('generate_manual_cleanup_patch', {
+          currentAdjustments: adjustments,
+          patchDefinition: patchDefinitionForBackend,
+          sourcePoint: [sourceX, sourceY],
+        });
+
+        const newPatchData = JSON.parse(newPatchDataJson);
+        patchesSentToBackend.delete(patchId);
+
+        setAdjustments((prev: Partial<Adjustments>) => ({
+          ...prev,
+          aiPatches: prev.aiPatches?.map((p: AiPatch) =>
+            p.id === patchId ? { ...p, patchData: newPatchData, isLoading: false } : p,
+          ),
+        }));
+      } catch (err: any) {
+        toast.error(`Cleanup Failed: ${err.message || String(err)}`);
+        setAdjustments((prev: Partial<Adjustments>) => ({
+          ...prev,
+          aiPatches: prev.aiPatches?.map((p: AiPatch) => (p.id === patchId ? { ...p, isLoading: false } : p)),
+        }));
+      }
+    },
+    [setAdjustments, getToken],
+  );
+
   const handleGenerativeReplace = useCallback(
     async (patchId: string, prompt: string, useFastInpaint: boolean) => {
       const { selectedImage, adjustments, isGeneratingAi, patchesSentToBackend } = useEditorStore.getState();
@@ -377,6 +421,7 @@ export function useAiMasking() {
   return {
     updateSubMask,
     handleGenerativeReplace,
+    handleManualCleanup,
     handleQuickErase,
     handleDeleteMaskContainer,
     handleDeleteAiPatch,

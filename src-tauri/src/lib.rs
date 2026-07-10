@@ -23,6 +23,7 @@ mod gpu_processing;
 mod hdr_deghosting;
 mod image_loader;
 mod image_processing;
+mod inpainting;
 mod lens_correction;
 mod lut_processing;
 mod mask_generation;
@@ -2317,7 +2318,8 @@ pub fn run() {
             ai_commands::generate_ai_depth_mask,
             ai_commands::check_ai_connector_status,
             ai_commands::test_ai_connector_connection,
-            ai_commands::invoke_generative_replace_with_mask_def,
+            inpainting::invoke_generative_replace_with_mask_def,
+            inpainting::generate_manual_cleanup_patch,
             denoising::apply_denoising,
             denoising::batch_denoise_images,
             denoising::save_denoised_image,
