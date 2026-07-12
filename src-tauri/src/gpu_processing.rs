@@ -1649,24 +1649,43 @@ fn process_and_get_dynamic_image_inner(
         return Ok(base_image.clone());
     }
 
-    let mut old_processor = None;
     let mut reallocated = false;
 
     let mut processor_lock = state.gpu_processor.lock().unwrap();
-    if processor_lock.is_none()
-        || processor_lock.as_ref().unwrap().width < width
-        || processor_lock.as_ref().unwrap().height < height
-    {
-        let new_width = (width + 255) & !255;
-        let new_height = (height + 255) & !255;
+    let mut needs_new_processor = false;
+    let new_width = (width + 255) & !255;
+    let new_height = (height + 255) & !255;
+
+    if let Some(p) = processor_lock.as_ref() {
+        if p.width < width || p.height < height {
+            needs_new_processor = true;
+        }
+    } else {
+        needs_new_processor = true;
+    }
+
+    if needs_new_processor {
         log::info!(
             "Creating new GPU Processor for dimensions up to {}x{}",
             new_width,
             new_height
         );
-        let new_processor = GpuProcessor::new(context.clone(), new_width, new_height)?;
 
-        old_processor = processor_lock.take();
+        if let Ok(mut display_lock) = context.display.lock()
+            && let Some(display) = display_lock.as_mut()
+        {
+            display.current_bind_group = None;
+        }
+
+        let old_processor = processor_lock.take();
+        drop(old_processor);
+
+        let _ = context.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(std::time::Duration::from_millis(500)),
+        });
+
+        let new_processor = GpuProcessor::new(context.clone(), new_width, new_height)?;
 
         *processor_lock = Some(crate::GpuProcessorState {
             processor: new_processor,
@@ -1675,80 +1694,64 @@ fn process_and_get_dynamic_image_inner(
         });
         reallocated = true;
     }
+
     let processor_state = processor_lock.as_ref().unwrap();
     let processor = &processor_state.processor;
 
-    if reallocated && let Some(old_state) = &old_processor {
-        let mut encoder = device.create_command_encoder(&Default::default());
-        let copy_w = old_state.width.min(processor_state.width);
-        let copy_h = old_state.height.min(processor_state.height);
-
-        encoder.copy_texture_to_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &old_state.processor.output_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyTextureInfo {
-                texture: &processor.output_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::Extent3d {
-                width: copy_w,
-                height: copy_h,
-                depth_or_array_layers: 1,
-            },
+    if reallocated
+        && let Ok(mut display_lock) = context.display.lock()
+        && let Some(display) = display_lock.as_mut()
+    {
+        display.latest_transform.texture_size =
+            [processor_state.width as f32, processor_state.height as f32];
+        queue.write_buffer(
+            &display.transform_buffer,
+            0,
+            bytemuck::bytes_of(&display.latest_transform),
         );
-        queue.submit(Some(encoder.finish()));
 
-        if let Ok(mut display_lock) = context.display.lock()
-            && let Some(display) = display_lock.as_mut()
-        {
-            display.latest_transform.texture_size =
-                [processor_state.width as f32, processor_state.height as f32];
-            queue.write_buffer(
-                &display.transform_buffer,
-                0,
-                bytemuck::bytes_of(&display.latest_transform),
-            );
-
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                layout: &display.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: display.transform_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(
-                            &processor.output_texture_view,
-                        ),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&display.sampler),
-                    },
-                ],
-                label: Some("Migrated Display Bind Group"),
-            });
-            display.current_bind_group = Some(bind_group);
-        }
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &display.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: display.transform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&processor.output_texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&display.sampler),
+                },
+            ],
+            label: Some("Migrated Display Bind Group"),
+        });
+        display.current_bind_group = Some(bind_group);
     }
 
     let mut cache_lock = state.gpu_image_cache.lock().unwrap();
-    if let Some(cache) = &*cache_lock
-        && (cache.transform_hash != transform_hash
-            || cache.width != width
-            || cache.height != height)
-    {
-        *cache_lock = None;
+    let mut needs_new_cache = false;
+
+    if let Some(cache) = &*cache_lock {
+        if cache.transform_hash != transform_hash || cache.width != width || cache.height != height
+        {
+            needs_new_cache = true;
+        }
+    } else {
+        needs_new_cache = true;
     }
 
-    if cache_lock.is_none() {
+    if needs_new_cache {
+        let old_cache = cache_lock.take();
+        drop(old_cache);
+
+        let _ = context.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(std::time::Duration::from_millis(500)),
+        });
+
         let img_rgba_f16 = to_rgba_f16(base_image);
         let texture_size = wgpu::Extent3d {
             width,
@@ -1993,8 +1996,6 @@ fn process_and_get_dynamic_image_inner(
         display.current_bind_group = Some(bind_group);
         display.render(device, queue);
     }
-
-    drop(old_processor);
 
     if skip_readback {
         let duration = start_time.elapsed();
