@@ -17,16 +17,16 @@ use rawler::Orientation;
 use rayon::prelude::*;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::panic;
 use std::path::Path;
-use std::sync::OnceLock;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
-use std::time::Instant;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Instant, UNIX_EPOCH};
 
 #[derive(serde::Serialize)]
 pub struct LoadImageResult {
@@ -46,6 +46,116 @@ struct PatchMaskInfo {
     invert: bool,
     #[serde(default)]
     sub_masks: Vec<SubMask>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RawSourceFingerprint {
+    path: String,
+    file_len: u64,
+    modified_nanos: u128,
+}
+
+#[derive(Debug, Clone)]
+struct RawDecodeFailure {
+    message: String,
+    allow_embedded_preview: bool,
+}
+
+const RAW_FAILURE_CACHE_CAPACITY: usize = 128;
+
+fn raw_failure_cache() -> &'static Mutex<HashMap<RawSourceFingerprint, RawDecodeFailure>> {
+    static CACHE: OnceLock<Mutex<HashMap<RawSourceFingerprint, RawDecodeFailure>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn raw_metadata_failure_cache() -> &'static Mutex<HashSet<RawSourceFingerprint>> {
+    static CACHE: OnceLock<Mutex<HashSet<RawSourceFingerprint>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn raw_dimension_failure_cache() -> &'static Mutex<HashSet<RawSourceFingerprint>> {
+    static CACHE: OnceLock<Mutex<HashSet<RawSourceFingerprint>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn raw_source_fingerprint(path: &Path, fallback_len: u64) -> RawSourceFingerprint {
+    let metadata = fs::metadata(path).ok();
+    let file_len = metadata
+        .as_ref()
+        .map(std::fs::Metadata::len)
+        .unwrap_or(fallback_len);
+    let modified_nanos = metadata
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    RawSourceFingerprint {
+        path: path.to_string_lossy().into_owned(),
+        file_len,
+        modified_nanos,
+    }
+}
+
+fn cached_raw_decode_failure(key: &RawSourceFingerprint) -> Option<RawDecodeFailure> {
+    raw_failure_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(key)
+        .cloned()
+}
+
+fn remember_raw_decode_failure(key: RawSourceFingerprint, failure: RawDecodeFailure) {
+    let mut cache = raw_failure_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cache.len() >= RAW_FAILURE_CACHE_CAPACITY {
+        cache.clear();
+    }
+    cache.insert(key, failure);
+}
+
+pub(crate) fn cached_raw_decode_failure_for_path(path: &Path) -> Option<String> {
+    let key = raw_source_fingerprint(path, 0);
+    cached_raw_decode_failure(&key).map(|failure| failure.message)
+}
+
+pub(crate) fn cached_raw_metadata_failure_for_path(path: &Path) -> bool {
+    let key = raw_source_fingerprint(path, 0);
+    raw_metadata_failure_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(&key)
+}
+
+pub(crate) fn remember_raw_metadata_panic_for_path(path: &Path) {
+    let key = raw_source_fingerprint(path, 0);
+    let mut cache = raw_metadata_failure_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cache.len() >= RAW_FAILURE_CACHE_CAPACITY {
+        cache.clear();
+    }
+    cache.insert(key);
+}
+
+pub(crate) fn cached_raw_dimension_failure_for_path(path: &Path) -> bool {
+    let key = raw_source_fingerprint(path, 0);
+    raw_dimension_failure_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(&key)
+}
+
+pub(crate) fn remember_raw_dimension_panic_for_path(path: &Path) {
+    let key = raw_source_fingerprint(path, 0);
+    let mut cache = raw_dimension_failure_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cache.len() >= RAW_FAILURE_CACHE_CAPACITY {
+        cache.clear();
+    }
+    cache.insert(key);
 }
 
 fn srgb_to_linear_lut() -> &'static [f32; 256] {
@@ -96,13 +206,61 @@ pub fn load_base_image_from_bytes(
     let sharpening_amount = settings.raw_preprocessing_sharpening.unwrap_or(0.35);
     let apply_to_non_raws = settings.apply_preprocessing_to_non_raws.unwrap_or(false);
 
-    crate::exif_processing::persist_exif_if_missing(
-        Path::new(path_for_ext_check),
-        path_for_ext_check,
-        bytes,
-    );
+    let source_path = Path::new(path_for_ext_check);
+    let is_raw = is_raw_file(path_for_ext_check);
+    let raw_fingerprint = is_raw.then(|| raw_source_fingerprint(source_path, bytes.len() as u64));
 
-    if is_raw_file(path_for_ext_check) {
+    if let Some(key) = raw_fingerprint.as_ref() {
+        if let Some(failure) = cached_raw_decode_failure(key) {
+            log::debug!(
+                "Skipping cached RAW decode failure for '{}': {}",
+                path_for_ext_check,
+                failure.message
+            );
+            if failure.allow_embedded_preview
+                && let Some(preview) = safe_embedded_preview_fallback(bytes, path_for_ext_check)
+            {
+                return Ok(linearize_embedded_preview(preview));
+            }
+            return Err(anyhow!(
+                "Cached RAW decode failure for '{}': {}",
+                path_for_ext_check,
+                failure.message
+            ));
+        }
+
+        let metadata_failure_known = raw_metadata_failure_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(key);
+        if !metadata_failure_known {
+            let persist_result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                crate::exif_processing::persist_exif_if_missing(
+                    source_path,
+                    path_for_ext_check,
+                    bytes,
+                );
+            }));
+            if persist_result.is_err() {
+                log::warn!(
+                    "RAW metadata extraction panicked for '{}'; future attempts for this file revision will skip metadata extraction",
+                    path_for_ext_check
+                );
+                let mut cache = raw_metadata_failure_cache()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if cache.len() >= RAW_FAILURE_CACHE_CAPACITY {
+                    cache.clear();
+                }
+                cache.insert(key.clone());
+            }
+        }
+    } else {
+        crate::exif_processing::persist_exif_if_missing(source_path, path_for_ext_check, bytes);
+    }
+
+    if is_raw {
+        let raw_started = Instant::now();
         match panic::catch_unwind(move || {
             crate::raw_processing::develop_raw_image(
                 bytes,
@@ -113,6 +271,11 @@ pub fn load_base_image_from_bytes(
             )
         }) {
             Ok(Ok(mut image)) => {
+                log::info!(
+                    "Export/load stage RAW decode for '{}' took {:?}",
+                    path_for_ext_check,
+                    raw_started.elapsed()
+                );
                 if !use_fast_raw_dev && (color_nr_amount > 0.0 || sharpening_amount > 0.0) {
                     let start = Instant::now();
                     remove_raw_artifacts_and_enhance(
@@ -137,11 +300,27 @@ pub fn load_base_image_from_bytes(
                 }
 
                 log::warn!(
+                    "Export/load stage RAW decode for '{}' failed after {:?}",
+                    path_for_ext_check,
+                    raw_started.elapsed()
+                );
+
+                if let Some(key) = raw_fingerprint.clone() {
+                    remember_raw_decode_failure(
+                        key,
+                        RawDecodeFailure {
+                            message: classified.to_string(),
+                            allow_embedded_preview: true,
+                        },
+                    );
+                }
+
+                log::warn!(
                     "Error developing RAW file '{}': {}",
                     path_for_ext_check,
                     classified
                 );
-                if let Some(preview) = embedded_preview_fallback(bytes, path_for_ext_check) {
+                if let Some(preview) = safe_embedded_preview_fallback(bytes, path_for_ext_check) {
                     log::warn!(
                         "Using embedded preview fallback for '{}' ({}x{})",
                         path_for_ext_check,
@@ -149,31 +328,37 @@ pub fn load_base_image_from_bytes(
                         preview.height()
                     );
 
-                    let mut linear_preview = apply_srgb_to_linear(preview);
-                    match &mut linear_preview {
-                        image::DynamicImage::ImageRgb32F(img) => {
-                            for p in img.pixels_mut() {
-                                p[0] *= 0.4;
-                                p[1] *= 0.4;
-                                p[2] *= 0.4;
-                            }
-                        }
-                        image::DynamicImage::ImageRgba32F(img) => {
-                            for p in img.pixels_mut() {
-                                p[0] *= 0.4;
-                                p[1] *= 0.4;
-                                p[2] *= 0.4;
-                            }
-                        }
-                        _ => {}
-                    }
-
-                    return Ok(linear_preview);
+                    return Ok(linearize_embedded_preview(preview));
                 }
                 Err(classified)
             }
             Err(_) => {
+                let message = format!("RAW decoder panicked for '{path_for_ext_check}'");
+                if let Some(key) = raw_fingerprint {
+                    remember_raw_decode_failure(
+                        key,
+                        RawDecodeFailure {
+                            message: message.clone(),
+                            allow_embedded_preview: true,
+                        },
+                    );
+                }
                 log::error!("Panic while processing RAW file: {}", path_for_ext_check);
+                log::warn!(
+                    "Export/load stage RAW decode for '{}' panicked after {:?}",
+                    path_for_ext_check,
+                    raw_started.elapsed()
+                );
+                if let Some(preview) = safe_embedded_preview_fallback(bytes, path_for_ext_check) {
+                    log::warn!(
+                        "Using embedded preview fallback for '{}' after RAW decoder panic ({}x{})",
+                        path_for_ext_check,
+                        preview.width(),
+                        preview.height()
+                    );
+
+                    return Ok(linearize_embedded_preview(preview));
+                }
                 Err(anyhow!(
                     "Failed to process RAW file: {}",
                     path_for_ext_check
@@ -259,11 +444,19 @@ fn largest_tiff_jpeg_preview(buf: &[u8]) -> Option<DynamicImage> {
 
         for i in 0..n {
             let e = ifd as usize + 2 + (i as usize) * 12;
-            let (Some(tag), Some(count), Some(val)) = (rd16(e), rd32(e + 4), rd32(e + 8)) else {
+            let (Some(tag), Some(field_type), Some(count), Some(val)) =
+                (rd16(e), rd16(e + 2), rd32(e + 4), rd32(e + 8))
+            else {
                 continue;
             };
             match tag {
-                259 => compression = val,
+                259 => {
+                    compression = if field_type == 3 && count == 1 {
+                        if le { val & 0xffff } else { val >> 16 }
+                    } else {
+                        val
+                    }
+                }
                 273 if count == 1 => strip = Some((val, strip.map_or(0, |s| s.1))),
                 279 if count == 1 => strip = strip.map(|s| (s.0, val)).or(Some((0, val))),
                 513 => old_jpeg = Some((val, old_jpeg.map_or(0, |s| s.1))),
@@ -336,6 +529,40 @@ fn embedded_preview_fallback(bytes: &[u8], path: &str) -> Option<DynamicImage> {
     })
 }
 
+fn safe_embedded_preview_fallback(bytes: &[u8], path: &str) -> Option<DynamicImage> {
+    match panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        embedded_preview_fallback(bytes, path)
+    })) {
+        Ok(preview) => preview,
+        Err(_) => {
+            log::warn!("Embedded RAW preview extraction panicked for '{}'", path);
+            None
+        }
+    }
+}
+
+fn linearize_embedded_preview(preview: DynamicImage) -> DynamicImage {
+    let mut linear_preview = apply_srgb_to_linear(preview);
+    match &mut linear_preview {
+        image::DynamicImage::ImageRgb32F(img) => {
+            for pixel in img.pixels_mut() {
+                pixel[0] *= 0.4;
+                pixel[1] *= 0.4;
+                pixel[2] *= 0.4;
+            }
+        }
+        image::DynamicImage::ImageRgba32F(img) => {
+            for pixel in img.pixels_mut() {
+                pixel[0] *= 0.4;
+                pixel[1] *= 0.4;
+                pixel[2] *= 0.4;
+            }
+        }
+        _ => {}
+    }
+    linear_preview
+}
+
 pub fn load_image_with_orientation(
     bytes: &[u8],
     cancel_token: Option<(Arc<AtomicUsize>, usize)>,
@@ -378,7 +605,11 @@ pub fn load_image_with_orientation(
         }
     };
 
-    Ok(DynamicImage::ImageRgb32F(oriented_image.to_rgb32f()))
+    if oriented_image.color().has_alpha() {
+        Ok(DynamicImage::ImageRgba32F(oriented_image.to_rgba32f()))
+    } else {
+        Ok(DynamicImage::ImageRgb32F(oriented_image.to_rgb32f()))
+    }
 }
 
 pub fn composite_patches_on_image(
@@ -801,7 +1032,11 @@ pub async fn load_image(
                             cancel_token.clone(),
                         )
                         .map_err(|e| e.to_string())?;
-                        let exif = exif_processing::read_exif_data(&path_clone, &mmap);
+                        let exif = if cached_raw_metadata_failure_for_path(Path::new(&path_clone)) {
+                            HashMap::new()
+                        } else {
+                            exif_processing::read_exif_data(&path_clone, &mmap)
+                        };
                         Ok((img, exif))
                     }
                     Err(e) => {
@@ -826,7 +1061,11 @@ pub async fn load_image(
                             cancel_token.clone(),
                         )
                         .map_err(|e| e.to_string())?;
-                        let exif = exif_processing::read_exif_data(&path_clone, &bytes);
+                        let exif = if cached_raw_metadata_failure_for_path(Path::new(&path_clone)) {
+                            HashMap::new()
+                        } else {
+                            exif_processing::read_exif_data(&path_clone, &bytes)
+                        };
                         Ok((img, exif))
                     }
                 })();
@@ -871,4 +1110,70 @@ pub async fn load_image(
         exif: exif_data,
         is_raw,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_failure_cache_is_invalidated_by_file_revision() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fixture.dng");
+        fs::write(&path, b"first").unwrap();
+
+        let key = raw_source_fingerprint(&path, 0);
+        remember_raw_decode_failure(
+            key,
+            RawDecodeFailure {
+                message: "synthetic decode panic".to_string(),
+                allow_embedded_preview: false,
+            },
+        );
+        assert_eq!(
+            cached_raw_decode_failure_for_path(&path).as_deref(),
+            Some("synthetic decode panic")
+        );
+
+        fs::write(&path, b"changed-length").unwrap();
+        assert!(cached_raw_decode_failure_for_path(&path).is_none());
+    }
+
+    #[test]
+    fn big_endian_tiff_preview_reads_inline_short_compression() {
+        let source =
+            DynamicImage::ImageRgb8(image::RgbImage::from_pixel(2, 1, image::Rgb([20, 40, 60])));
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 90)
+            .encode_image(&source)
+            .unwrap();
+
+        const IFD_OFFSET: u32 = 8;
+        const ENTRY_COUNT: u16 = 3;
+        let jpeg_offset = IFD_OFFSET + 2 + u32::from(ENTRY_COUNT) * 12 + 4;
+        let mut tiff = Vec::with_capacity(jpeg_offset as usize + jpeg.len());
+        tiff.extend_from_slice(b"MM\0*");
+        tiff.extend_from_slice(&IFD_OFFSET.to_be_bytes());
+        tiff.extend_from_slice(&ENTRY_COUNT.to_be_bytes());
+
+        tiff.extend_from_slice(&259u16.to_be_bytes());
+        tiff.extend_from_slice(&3u16.to_be_bytes());
+        tiff.extend_from_slice(&1u32.to_be_bytes());
+        tiff.extend_from_slice(&[0, 7, 0, 0]);
+
+        tiff.extend_from_slice(&273u16.to_be_bytes());
+        tiff.extend_from_slice(&4u16.to_be_bytes());
+        tiff.extend_from_slice(&1u32.to_be_bytes());
+        tiff.extend_from_slice(&jpeg_offset.to_be_bytes());
+
+        tiff.extend_from_slice(&279u16.to_be_bytes());
+        tiff.extend_from_slice(&4u16.to_be_bytes());
+        tiff.extend_from_slice(&1u32.to_be_bytes());
+        tiff.extend_from_slice(&(jpeg.len() as u32).to_be_bytes());
+        tiff.extend_from_slice(&0u32.to_be_bytes());
+        tiff.extend_from_slice(&jpeg);
+
+        let preview = largest_tiff_jpeg_preview(&tiff).expect("big-endian JPEG preview");
+        assert_eq!(preview.dimensions(), (2, 1));
+    }
 }
