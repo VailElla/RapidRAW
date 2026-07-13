@@ -781,6 +781,21 @@
       "selectFolderTitle_other": "Wybierz folder do eksportu {{count}} obrazów"
     },
     "file": {
+      "bitDepth": {
+        "label": "Głębia bitowa",
+        "options": {
+          "eight": "8 bitów",
+          "sixteen": "16 bitów"
+        }
+      },
+      "encodingSpeed": {
+        "label": "Szybkość kodowania",
+        "options": {
+          "fast": "Szybka",
+          "balanced": "Zrównoważona",
+          "bestCompression": "Najlepsza kompresja"
+        }
+      },
       "quality": "Jakość",
       "qualityLossless": "Jakość (Bezstratna)"
     },

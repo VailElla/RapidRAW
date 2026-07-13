@@ -741,6 +741,21 @@
       "selectFolderTitle_other": "Seleziona Cartella per Esportare {{count}} Immagini"
     },
     "file": {
+      "bitDepth": {
+        "label": "Profondità in bit",
+        "options": {
+          "eight": "8 bit",
+          "sixteen": "16 bit"
+        }
+      },
+      "encodingSpeed": {
+        "label": "Velocità di codifica",
+        "options": {
+          "fast": "Veloce",
+          "balanced": "Bilanciata",
+          "bestCompression": "Migliore compressione"
+        }
+      },
       "quality": "Qualità",
       "qualityLossless": "Qualità (Senza Perdita)"
     },

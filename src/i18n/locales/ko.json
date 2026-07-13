@@ -741,6 +741,21 @@
       "selectFolderTitle_other": "이미지 {{count}}개를 내보낼 폴더 선택"
     },
     "file": {
+      "bitDepth": {
+        "label": "비트 심도",
+        "options": {
+          "eight": "8비트",
+          "sixteen": "16비트"
+        }
+      },
+      "encodingSpeed": {
+        "label": "인코딩 속도",
+        "options": {
+          "fast": "빠름",
+          "balanced": "균형",
+          "bestCompression": "최고 압축"
+        }
+      },
       "quality": "품질",
       "qualityLossless": "품질 (무손실)"
     },

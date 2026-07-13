@@ -741,6 +741,21 @@
       "selectFolderTitle_other": "Selecionar Pasta para Exportar {{count}} Imagens"
     },
     "file": {
+      "bitDepth": {
+        "label": "Profundidade de bits",
+        "options": {
+          "eight": "8 bits",
+          "sixteen": "16 bits"
+        }
+      },
+      "encodingSpeed": {
+        "label": "Velocidade de codificação",
+        "options": {
+          "fast": "Rápida",
+          "balanced": "Equilibrada",
+          "bestCompression": "Melhor compressão"
+        }
+      },
       "quality": "Qualidade",
       "qualityLossless": "Qualidade (Sem Perdas)"
     },

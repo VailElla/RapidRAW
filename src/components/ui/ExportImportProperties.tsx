@@ -33,9 +33,14 @@ export const FILENAME_VARIABLES: Array<string> = [
   '{mm}',
 ];
 
+export type JxlBitDepth = 8 | 16;
+export type JxlEffort = 4 | 5 | 7;
+
 export interface ExportSettings {
   filenameTemplate: string | null;
   jpegQuality: number;
+  jxlBitDepth?: JxlBitDepth;
+  jxlEffort?: JxlEffort;
   keepMetadata: boolean;
   preserveTimestamps: boolean;
   resize: {
@@ -102,6 +107,8 @@ export interface ExportPreset {
   name: string;
   fileFormat: string;
   jpegQuality: number;
+  jxlBitDepth?: JxlBitDepth;
+  jxlEffort?: JxlEffort;
   enableResize: boolean;
   resizeMode: string;
   resizeValue: number;

@@ -1,9 +1,16 @@
 import { useState, useMemo, useCallback } from 'react';
-import { ExportPreset, WatermarkAnchor } from '../components/ui/ExportImportProperties';
+import {
+  ExportPreset,
+  type JxlBitDepth,
+  type JxlEffort,
+  WatermarkAnchor,
+} from '../components/ui/ExportImportProperties';
 
 export function useExportSettings() {
   const [fileFormat, setFileFormat] = useState('jpeg');
   const [jpegQuality, setJpegQuality] = useState(90);
+  const [jxlBitDepth, setJxlBitDepth] = useState<JxlBitDepth>(8);
+  const [jxlEffort, setJxlEffort] = useState<JxlEffort>(5);
   const [enableResize, setEnableResize] = useState(false);
   const [resizeMode, setResizeMode] = useState('longEdge');
   const [resizeValue, setResizeValue] = useState(2048);
@@ -24,6 +31,8 @@ export function useExportSettings() {
   const handleApplyPreset = useCallback((preset: ExportPreset) => {
     setFileFormat(preset.fileFormat);
     setJpegQuality(preset.jpegQuality);
+    setJxlBitDepth(preset.jxlBitDepth ?? 8);
+    setJxlEffort(preset.jxlEffort ?? 5);
     setEnableResize(preset.enableResize);
     setResizeMode(preset.resizeMode);
     setResizeValue(preset.resizeValue);
@@ -46,6 +55,8 @@ export function useExportSettings() {
     () => ({
       fileFormat,
       jpegQuality,
+      jxlBitDepth,
+      jxlEffort,
       enableResize,
       resizeMode,
       resizeValue,
@@ -66,6 +77,8 @@ export function useExportSettings() {
     [
       fileFormat,
       jpegQuality,
+      jxlBitDepth,
+      jxlEffort,
       enableResize,
       resizeMode,
       resizeValue,
@@ -82,7 +95,7 @@ export function useExportSettings() {
       watermarkScale,
       watermarkSpacing,
       watermarkOpacity,
-    ]
+    ],
   );
 
   return {
@@ -90,6 +103,10 @@ export function useExportSettings() {
     setFileFormat,
     jpegQuality,
     setJpegQuality,
+    jxlBitDepth,
+    setJxlBitDepth,
+    jxlEffort,
+    setJxlEffort,
     enableResize,
     setEnableResize,
     resizeMode,

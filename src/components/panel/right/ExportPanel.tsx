@@ -19,6 +19,8 @@ import {
   Status,
   ExportState,
   FileFormats,
+  type JxlBitDepth,
+  type JxlEffort,
   WatermarkAnchor,
 } from '../../ui/ExportImportProperties';
 import { Invokes, SelectedImage, AppSettings } from '../../ui/AppProperties';
@@ -196,11 +198,32 @@ export default function ExportPanel({
     [t],
   );
 
+  const jxlBitDepthOptions = useMemo(
+    () => [
+      { label: t('export.file.bitDepth.options.eight'), value: 8 as JxlBitDepth },
+      { label: t('export.file.bitDepth.options.sixteen'), value: 16 as JxlBitDepth },
+    ],
+    [t],
+  );
+
+  const jxlEffortOptions = useMemo(
+    () => [
+      { label: t('export.file.encodingSpeed.options.fast'), value: 4 as JxlEffort },
+      { label: t('export.file.encodingSpeed.options.balanced'), value: 5 as JxlEffort },
+      { label: t('export.file.encodingSpeed.options.bestCompression'), value: 7 as JxlEffort },
+    ],
+    [t],
+  );
+
   const {
     fileFormat,
     setFileFormat,
     jpegQuality,
     setJpegQuality,
+    jxlBitDepth,
+    setJxlBitDepth,
+    jxlEffort,
+    setJxlEffort,
     enableResize,
     setEnableResize,
     resizeMode,
@@ -278,6 +301,10 @@ export default function ExportPanel({
   const [watermarkImageAspectRatio, setWatermarkImageAspectRatio] = useState(1);
   const [imageAspectRatio, setImageAspectRatio] = useState(16 / 9);
   const filenameInputRef = useRef<HTMLInputElement>(null);
+  const estimateRequestIdRef = useRef(0);
+  const estimateCacheRef = useRef(new Map<string, { size: number; createdAt: number }>());
+  const adjustmentIdsRef = useRef(new WeakMap<object, number>());
+  const nextAdjustmentIdRef = useRef(1);
   const osPlatform = useOsPlatform();
   const isAndroid = osPlatform === 'android';
 
@@ -285,13 +312,17 @@ export default function ExportPanel({
   const isExporting = status === Status.Exporting;
   const isLibraryContext = !!onClose;
 
-  const pathsToExport = isLibraryContext
-    ? multiSelectedPaths
-    : multiSelectedPaths.length > 0
-      ? multiSelectedPaths
-      : selectedImage
-        ? [selectedImage.path]
-        : [];
+  const multiSelectedPathsKey = JSON.stringify(multiSelectedPaths);
+  const pathsToExport = useMemo(() => {
+    const stableMultiSelectedPaths = JSON.parse(multiSelectedPathsKey) as string[];
+    return isLibraryContext
+      ? stableMultiSelectedPaths
+      : stableMultiSelectedPaths.length > 0
+        ? stableMultiSelectedPaths
+        : selectedImage?.path
+          ? [selectedImage.path]
+          : [];
+  }, [isLibraryContext, multiSelectedPathsKey, selectedImage?.path]);
   const numImages = pathsToExport.length;
 
   useEffect(() => {
@@ -346,27 +377,66 @@ export default function ExportPanel({
 
   const debouncedEstimateSize = useMemo(
     () =>
-      debounce(async (paths, currentAdj, currentPath, exportSettings, format) => {
-        if (paths.length === 0 || !isVisible) {
-          setEstimatedSize(null);
-          return;
-        }
-        setIsEstimating(true);
-        try {
-          const size: number = await invoke(Invokes.EstimateExportSizes, {
-            paths,
-            exportSettings,
-            outputFormat: format,
-            currentEditPath: currentPath || null,
-            currentEditAdjustments: currentAdj || null,
-          });
-          setEstimatedSize(size);
-        } catch (err) {
-          setEstimatedSize(null);
-        } finally {
-          setIsEstimating(false);
-        }
-      }, 500),
+      debounce(
+        async (
+          paths: string[],
+          currentAdj: unknown,
+          currentPath: string | null | undefined,
+          exportSettings: ExportSettings,
+          format: string,
+          requestId: number,
+        ) => {
+          if (paths.length === 0 || !isVisible) {
+            if (requestId === estimateRequestIdRef.current) {
+              setEstimatedSize(null);
+              setIsEstimating(false);
+            }
+            return;
+          }
+
+          let adjustmentId = 0;
+          if (currentAdj && typeof currentAdj === 'object') {
+            const adjustmentObject = currentAdj as object;
+            adjustmentId = adjustmentIdsRef.current.get(adjustmentObject) ?? 0;
+            if (adjustmentId === 0) {
+              adjustmentId = nextAdjustmentIdRef.current++;
+              adjustmentIdsRef.current.set(adjustmentObject, adjustmentId);
+            }
+          }
+          const cacheKey = JSON.stringify([paths, currentPath ?? null, exportSettings, format, adjustmentId]);
+          const cachedEstimate = estimateCacheRef.current.get(cacheKey);
+          if (cachedEstimate && Date.now() - cachedEstimate.createdAt < 30_000) {
+            if (requestId === estimateRequestIdRef.current) {
+              setEstimatedSize(cachedEstimate.size);
+              setIsEstimating(false);
+            }
+            return;
+          }
+          if (cachedEstimate) estimateCacheRef.current.delete(cacheKey);
+
+          setIsEstimating(true);
+          try {
+            const size: number = await invoke(Invokes.EstimateExportSizes, {
+              paths,
+              exportSettings,
+              outputFormat: format,
+              currentEditPath: currentPath || null,
+              currentEditAdjustments: currentAdj || null,
+            });
+            if (estimateCacheRef.current.size >= 32) {
+              const oldestKey = estimateCacheRef.current.keys().next().value;
+              if (oldestKey !== undefined) estimateCacheRef.current.delete(oldestKey);
+            }
+            estimateCacheRef.current.set(cacheKey, { size, createdAt: Date.now() });
+            if (requestId === estimateRequestIdRef.current) setEstimatedSize(size);
+          } catch {
+            if (requestId === estimateRequestIdRef.current) setEstimatedSize(null);
+          } finally {
+            if (requestId === estimateRequestIdRef.current) setIsEstimating(false);
+          }
+        },
+        500,
+      ),
     [isVisible],
   );
 
@@ -374,6 +444,8 @@ export default function ExportPanel({
     const exportSettings: ExportSettings = {
       filenameTemplate,
       jpegQuality,
+      jxlBitDepth,
+      jxlEffort,
       keepMetadata,
       preserveTimestamps,
       preserveFolders,
@@ -392,7 +464,8 @@ export default function ExportPanel({
           : null,
     };
     const format = FILE_FORMATS.find((f: FileFormat) => f.id === fileFormat)?.extensions[0] || 'jpeg';
-    debouncedEstimateSize(pathsToExport, adjustments, selectedImage?.path, exportSettings, format);
+    const requestId = ++estimateRequestIdRef.current;
+    debouncedEstimateSize(pathsToExport, adjustments, selectedImage?.path, exportSettings, format, requestId);
     return () => debouncedEstimateSize.cancel();
   }, [
     pathsToExport,
@@ -400,6 +473,8 @@ export default function ExportPanel({
     selectedImage?.path,
     fileFormat,
     jpegQuality,
+    jxlBitDepth,
+    jxlEffort,
     enableResize,
     resizeMode,
     resizeValue,
@@ -450,6 +525,8 @@ export default function ExportPanel({
     const exportSettings: ExportSettings = {
       filenameTemplate: finalFilenameTemplate,
       jpegQuality,
+      jxlBitDepth,
+      jxlEffort,
       keepMetadata,
       preserveTimestamps,
       preserveFolders,
@@ -506,13 +583,12 @@ export default function ExportPanel({
 
       if (isAndroid || outputFolderOrFile) {
         if (!isAndroid) {
-          const dir =
-            shouldChooseOutputFile
-              ? outputFolderOrFile.substring(
-                  0,
-                  Math.max(outputFolderOrFile.lastIndexOf('/'), outputFolderOrFile.lastIndexOf('\\')),
-                )
-              : outputFolderOrFile;
+          const dir = shouldChooseOutputFile
+            ? outputFolderOrFile.substring(
+                0,
+                Math.max(outputFolderOrFile.lastIndexOf('/'), outputFolderOrFile.lastIndexOf('\\')),
+              )
+            : outputFolderOrFile;
           if (dir) saveLastUsedPreset(dir);
         }
 
@@ -606,6 +682,32 @@ export default function ExportPanel({
                   />
                 </div>
               )}
+              {fileFormat === FileFormats.Jxl && (
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between gap-4">
+                    <Text variant={TextVariants.label}>{t('export.file.bitDepth.label')}</Text>
+                    <Dropdown
+                      options={jxlBitDepthOptions}
+                      value={jxlBitDepth}
+                      onChange={setJxlBitDepth}
+                      disabled={isExporting}
+                      className="w-40"
+                    />
+                  </div>
+                  {jpegQuality < 100 && (
+                    <div className="flex items-center justify-between gap-4">
+                      <Text variant={TextVariants.label}>{t('export.file.encodingSpeed.label')}</Text>
+                      <Dropdown
+                        options={jxlEffortOptions}
+                        value={jxlEffort}
+                        onChange={setJxlEffort}
+                        disabled={isExporting}
+                        className="w-40"
+                      />
+                    </div>
+                  )}
+                </div>
+              )}
             </Section>
 
             {numImages > 1 && (
@@ -674,7 +776,7 @@ export default function ExportPanel({
                   )}
                 </Section>
 
-                {fileFormat == FileFormats.Jpeg && (
+                {[FileFormats.Jpeg, FileFormats.Jxl].includes(fileFormat as FileFormats) && (
                   <Section title={t('export.sections.metadata')}>
                     <Switch
                       checked={keepMetadata}

@@ -741,6 +741,21 @@
       "selectFolderTitle_other": "Выберите папку для экспорта {{count}} изображений"
     },
     "file": {
+      "bitDepth": {
+        "label": "Глубина цвета",
+        "options": {
+          "eight": "8 бит",
+          "sixteen": "16 бит"
+        }
+      },
+      "encodingSpeed": {
+        "label": "Скорость кодирования",
+        "options": {
+          "fast": "Быстро",
+          "balanced": "Сбалансированно",
+          "bestCompression": "Лучшее сжатие"
+        }
+      },
       "quality": "Качество",
       "qualityLossless": "Качество (без потерь)"
     },

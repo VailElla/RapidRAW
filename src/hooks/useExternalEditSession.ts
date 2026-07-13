@@ -56,6 +56,7 @@ export function useExternalEditSession(handleImageSelect: (path: string) => void
     const exportSettings: ExportSettings = {
       filenameTemplate: null,
       jpegQuality: session.jpegQuality,
+      jxlEffort: 5,
       keepMetadata: true,
       preserveTimestamps: false,
       preserveFolders: false,

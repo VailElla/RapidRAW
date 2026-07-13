@@ -220,6 +220,10 @@ pub struct ExportPreset {
     pub name: String,
     pub file_format: String,
     pub jpeg_quality: u8,
+    #[serde(default = "default_export_jxl_bit_depth")]
+    pub jxl_bit_depth: u8,
+    #[serde(default = "default_export_jxl_effort")]
+    pub jxl_effort: u8,
     pub enable_resize: bool,
     pub resize_mode: String,
     pub resize_value: u32,
@@ -241,6 +245,14 @@ pub struct ExportPreset {
     pub last_export_path: Option<String>,
 }
 
+const fn default_export_jxl_bit_depth() -> u8 {
+    8
+}
+
+const fn default_export_jxl_effort() -> u8 {
+    5
+}
+
 pub fn default_export_presets() -> Vec<ExportPreset> {
     vec![
         ExportPreset {
@@ -248,6 +260,8 @@ pub fn default_export_presets() -> Vec<ExportPreset> {
             name: "High Quality".to_string(),
             file_format: "jpeg".to_string(),
             jpeg_quality: 95,
+            jxl_bit_depth: 8,
+            jxl_effort: 5,
             enable_resize: false,
             resize_mode: "longEdge".to_string(),
             resize_value: 2048,
@@ -270,6 +284,8 @@ pub fn default_export_presets() -> Vec<ExportPreset> {
             name: "Fast (Web)".to_string(),
             file_format: "jpeg".to_string(),
             jpeg_quality: 80,
+            jxl_bit_depth: 8,
+            jxl_effort: 5,
             enable_resize: true,
             resize_mode: "width".to_string(),
             resize_value: 2048,
@@ -609,4 +625,35 @@ pub fn save_settings(settings: AppSettings, app_handle: AppHandle) -> Result<(),
         .unwrap()
         .set_capacity(cache_size);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_export_preset_defaults_jxl_fields() {
+        let preset = default_export_presets().remove(0);
+        let mut value = serde_json::to_value(preset).unwrap();
+        value.as_object_mut().unwrap().remove("jxlBitDepth");
+        value.as_object_mut().unwrap().remove("jxlEffort");
+
+        let restored: ExportPreset = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.jxl_bit_depth, 8);
+        assert_eq!(restored.jxl_effort, 5);
+    }
+
+    #[test]
+    fn export_preset_roundtrip_preserves_jxl_bit_depth() {
+        let mut preset = default_export_presets().remove(0);
+        preset.file_format = "jxl".to_string();
+        preset.jxl_bit_depth = 16;
+        preset.jxl_effort = 4;
+
+        let json = serde_json::to_string(&preset).unwrap();
+        let restored: ExportPreset = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.file_format, "jxl");
+        assert_eq!(restored.jxl_bit_depth, 16);
+        assert_eq!(restored.jxl_effort, 4);
+    }
 }

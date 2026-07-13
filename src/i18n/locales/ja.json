@@ -741,6 +741,21 @@
       "selectFolderTitle_other": "{{count}} 枚の画像を書き出すフォルダを選択"
     },
     "file": {
+      "bitDepth": {
+        "label": "ビット深度",
+        "options": {
+          "eight": "8ビット",
+          "sixteen": "16ビット"
+        }
+      },
+      "encodingSpeed": {
+        "label": "エンコード速度",
+        "options": {
+          "fast": "高速",
+          "balanced": "バランス",
+          "bestCompression": "最高圧縮"
+        }
+      },
       "quality": "画質",
       "qualityLossless": "画質 (ロスレス)"
     },

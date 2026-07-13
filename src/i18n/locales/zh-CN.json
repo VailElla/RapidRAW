@@ -741,6 +741,21 @@
       "selectFolderTitle_other": "选择文件夹以导出 {{count}} 张图像"
     },
     "file": {
+      "bitDepth": {
+        "label": "位深",
+        "options": {
+          "eight": "8 位",
+          "sixteen": "16 位"
+        }
+      },
+      "encodingSpeed": {
+        "label": "编码速度",
+        "options": {
+          "fast": "快速",
+          "balanced": "平衡",
+          "bestCompression": "最佳压缩"
+        }
+      },
       "quality": "质量",
       "qualityLossless": "质量（无损）"
     },
