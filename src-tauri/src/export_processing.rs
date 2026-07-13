@@ -10,6 +10,7 @@ use std::time::Instant;
 use image::codecs::jpeg::JpegEncoder;
 use image::{DynamicImage, GenericImageView, GrayImage, ImageBuffer, ImageFormat, Luma, imageops};
 use jxl_encoder::{ImageMetadata as JxlImageMetadata, LosslessConfig, LossyConfig, PixelLayout};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -1072,25 +1073,42 @@ fn quantize_image_to_jxl_u16(image: &DynamicImage, has_alpha: bool) -> Result<Ve
     match (image, has_alpha) {
         (DynamicImage::ImageRgba32F(buffer), true) => buffer
             .as_raw()
-            .iter()
+            .par_iter()
             .copied()
             .map(quantize_unit_f32_to_u16)
             .collect(),
-        (DynamicImage::ImageRgba32F(buffer), false) => buffer
-            .as_raw()
-            .chunks_exact(4)
-            .flat_map(|pixel| pixel[..3].iter().copied())
-            .map(quantize_unit_f32_to_u16)
-            .collect(),
+        (DynamicImage::ImageRgba32F(buffer), false) => {
+            let source = buffer.as_raw();
+            let mut quantized = vec![0u16; source.len() / 4 * 3];
+            quantized
+                .par_chunks_mut(3)
+                .zip(source.par_chunks_exact(4))
+                .try_for_each(|(output, input)| {
+                    output[0] = quantize_unit_f32_to_u16(input[0])?;
+                    output[1] = quantize_unit_f32_to_u16(input[1])?;
+                    output[2] = quantize_unit_f32_to_u16(input[2])?;
+                    Ok::<(), String>(())
+                })?;
+            Ok(quantized)
+        }
         (DynamicImage::ImageRgb32F(buffer), false) => buffer
             .as_raw()
-            .iter()
+            .par_iter()
             .copied()
             .map(quantize_unit_f32_to_u16)
             .collect(),
         (_, true) => Ok(image.to_rgba16().into_raw()),
         (_, false) => Ok(image.to_rgb16().into_raw()),
     }
+}
+
+fn lossless_jxl_config(jxl_effort: u8) -> LosslessConfig {
+    // A single large export can use the ambient Rayon pool's CPU cores;
+    // concurrent exports share that bounded pool instead of each creating a
+    // dedicated pool and oversubscribing the machine.
+    LosslessConfig::new()
+        .with_effort(jxl_effort)
+        .with_threads(0)
 }
 
 fn encode_jxl_pixels(
@@ -1103,8 +1121,14 @@ fn encode_jxl_pixels(
     jxl_exif_tiff: Option<&[u8]>,
 ) -> Result<Vec<u8>, String> {
     let encode_started = Instant::now();
+    if !matches!(jxl_effort, 4 | 5 | 7) {
+        return Err(format!(
+            "Unsupported JXL effort {jxl_effort}; expected 4, 5, or 7"
+        ));
+    }
+
     let (mode, effort, distance, result) = if jpeg_quality == 100 {
-        let config = LosslessConfig::new();
+        let config = lossless_jxl_config(jxl_effort);
         let result = if let Some(exif_tiff) = jxl_exif_tiff {
             let metadata = JxlImageMetadata::new().with_exif(exif_tiff);
             config
@@ -1117,13 +1141,8 @@ fn encode_jxl_pixels(
                 .encode(pixels, width, height, layout)
                 .map_err(|e| format!("Failed to encode lossless JXL: {e}"))
         };
-        ("lossless", 7, None, result)
+        ("lossless", jxl_effort, None, result)
     } else {
-        if !matches!(jxl_effort, 4 | 5 | 7) {
-            return Err(format!(
-                "Unsupported JXL effort {jxl_effort}; expected 4, 5, or 7"
-            ));
-        }
         // Preserve RapidRAW's existing quality-slider mapping for lossy JXL.
         let distance = ((100.0 - jpeg_quality as f32) / 10.0).max(0.01);
         // `threads=0` uses the shared ambient Rayon pool. Batch exports then
@@ -1149,7 +1168,8 @@ fn encode_jxl_pixels(
 
     match &result {
         Ok(bytes) => log::info!(
-            "JXL codec encode {width}x{height} mode={mode} effort={effort} distance={distance:?} shared_parallel=true output_bytes={} took {:?}",
+            "JXL codec encode {width}x{height} mode={mode} effort={effort} distance={distance:?} shared_parallel_threads={} output_bytes={} took {:?}",
+            rayon::current_num_threads(),
             bytes.len(),
             encode_started.elapsed()
         ),
@@ -1180,7 +1200,13 @@ fn encode_image_to_bytes(
             let jxl_data = match (jxl_bit_depth, has_alpha) {
                 (8, true) => {
                     let conversion_started = Instant::now();
-                    let rgba = image.to_rgba8();
+                    let converted;
+                    let rgba = if let DynamicImage::ImageRgba8(buffer) = image {
+                        buffer
+                    } else {
+                        converted = image.to_rgba8();
+                        &converted
+                    };
                     log::info!(
                         "JXL export stage pixel-conversion depth=8 channels=4 took {:?}",
                         conversion_started.elapsed()
@@ -1197,7 +1223,13 @@ fn encode_image_to_bytes(
                 }
                 (8, false) => {
                     let conversion_started = Instant::now();
-                    let rgb = image.to_rgb8();
+                    let converted;
+                    let rgb = if let DynamicImage::ImageRgb8(buffer) = image {
+                        buffer
+                    } else {
+                        converted = image.to_rgb8();
+                        &converted
+                    };
                     log::info!(
                         "JXL export stage pixel-conversion depth=8 channels=3 took {:?}",
                         conversion_started.elapsed()
@@ -1213,32 +1245,48 @@ fn encode_image_to_bytes(
                     )?
                 }
                 (16, has_alpha) => {
-                    let quantize_started = Instant::now();
-                    let samples = quantize_image_to_jxl_u16(image, has_alpha)?;
-                    log::info!(
-                        "JXL export stage quantize depth=16 channels={} took {:?}",
-                        if has_alpha { 4 } else { 3 },
-                        quantize_started.elapsed()
-                    );
                     // jxl-encoder's RGB16/RGBA16 layouts explicitly consume
                     // native-endian u16 samples. Casting this u16 allocation
                     // therefore supplies the required host-native byte order
                     // without an additional full-image buffer.
-                    let pixels: &[u8] = bytemuck::cast_slice(&samples);
                     let layout = if has_alpha {
                         PixelLayout::Rgba16
                     } else {
                         PixelLayout::Rgb16
                     };
-                    encode_jxl_pixels(
-                        pixels,
-                        width,
-                        height,
-                        layout,
-                        jpeg_quality,
-                        jxl_effort,
-                        jxl_exif_tiff,
-                    )?
+                    let native_samples = match (image, has_alpha) {
+                        (DynamicImage::ImageRgba16(buffer), true) => Some(buffer.as_raw()),
+                        (DynamicImage::ImageRgb16(buffer), false) => Some(buffer.as_raw()),
+                        _ => None,
+                    };
+                    if let Some(samples) = native_samples {
+                        encode_jxl_pixels(
+                            bytemuck::cast_slice(samples),
+                            width,
+                            height,
+                            layout,
+                            jpeg_quality,
+                            jxl_effort,
+                            jxl_exif_tiff,
+                        )?
+                    } else {
+                        let quantize_started = Instant::now();
+                        let samples = quantize_image_to_jxl_u16(image, has_alpha)?;
+                        log::info!(
+                            "JXL export stage quantize depth=16 channels={} parallel=true took {:?}",
+                            if has_alpha { 4 } else { 3 },
+                            quantize_started.elapsed()
+                        );
+                        encode_jxl_pixels(
+                            bytemuck::cast_slice(&samples),
+                            width,
+                            height,
+                            layout,
+                            jpeg_quality,
+                            jxl_effort,
+                            jxl_exif_tiff,
+                        )?
+                    }
                 }
                 (other, _) => {
                     return Err(format!(
@@ -2302,15 +2350,26 @@ mod tests {
             RgbImage::from_raw(2, 2, pixels.clone()).expect("valid RGB8 fixture"),
         );
 
-        let encoded = encode_image_to_bytes(&image, "jxl", 100, 8, 5, None).unwrap();
-        let decoded = decode_jxl(&encoded);
-        assert_jxl_contract(&decoded, 2, 2, 8, 3);
-        let actual: Vec<u8> = decoded_u16(&decoded, u8::MAX as f32)
-            .into_iter()
-            .map(|sample| sample as u8)
-            .collect();
-        assert_eq!(actual, pixels);
-        verify_jxl_export(&encoded, 2, 2, 8, 3, false, true, None).unwrap();
+        for effort in [4, 5, 7] {
+            let encoded = encode_image_to_bytes(&image, "jxl", 100, 8, effort, None).unwrap();
+            let decoded = decode_jxl(&encoded);
+            assert_jxl_contract(&decoded, 2, 2, 8, 3);
+            let actual: Vec<u8> = decoded_u16(&decoded, u8::MAX as f32)
+                .into_iter()
+                .map(|sample| sample as u8)
+                .collect();
+            assert_eq!(actual, pixels, "effort {effort} changed pixels");
+            verify_jxl_export(&encoded, 2, 2, 8, 3, false, true, None).unwrap();
+        }
+    }
+
+    #[test]
+    fn lossless_jxl_uses_selected_effort_on_the_shared_pool() {
+        for effort in [4, 5, 7] {
+            let config = lossless_jxl_config(effort);
+            assert_eq!(config.effort(), effort);
+            assert_eq!(config.threads(), 0);
+        }
     }
 
     #[test]
@@ -2527,10 +2586,12 @@ mod tests {
     }
 
     #[test]
-    fn lossy_jxl_rejects_unsupported_effort() {
+    fn jxl_rejects_unsupported_effort_in_both_codec_modes() {
         let image = DynamicImage::new_rgb8(2, 2);
-        let error = encode_image_to_bytes(&image, "jxl", 92, 8, 6, None).unwrap_err();
-        assert!(error.contains("expected 4, 5, or 7"));
+        for quality in [100, 92] {
+            let error = encode_image_to_bytes(&image, "jxl", quality, 8, 6, None).unwrap_err();
+            assert!(error.contains("expected 4, 5, or 7"));
+        }
     }
 
     #[test]

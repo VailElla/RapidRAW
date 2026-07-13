@@ -698,18 +698,16 @@ export default function ExportPanel({
                       className="w-40"
                     />
                   </div>
-                  {jpegQuality < 100 && (
-                    <div className="flex items-center justify-between gap-4">
-                      <Text variant={TextVariants.label}>{t('export.file.encodingSpeed.label')}</Text>
-                      <Dropdown
-                        options={jxlEffortOptions}
-                        value={jxlEffort}
-                        onChange={setJxlEffort}
-                        disabled={isExporting}
-                        className="w-40"
-                      />
-                    </div>
-                  )}
+                  <div className="flex items-center justify-between gap-4">
+                    <Text variant={TextVariants.label}>{t('export.file.encodingSpeed.label')}</Text>
+                    <Dropdown
+                      options={jxlEffortOptions}
+                      value={jxlEffort}
+                      onChange={setJxlEffort}
+                      disabled={isExporting}
+                      className="w-40"
+                    />
+                  </div>
                 </div>
               )}
             </Section>
