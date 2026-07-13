@@ -1195,9 +1195,9 @@ pub fn apply_orientation(image: DynamicImage, orientation: Orientation) -> Dynam
         Orientation::HorizontalFlip => image.fliph(),
         Orientation::Rotate180 => image.rotate180(),
         Orientation::VerticalFlip => image.flipv(),
-        Orientation::Transpose => image.rotate90().flipv(),
+        Orientation::Transpose => image.rotate90().fliph(),
         Orientation::Rotate90 => image.rotate90(),
-        Orientation::Transverse => image.rotate90().fliph(),
+        Orientation::Transverse => image.rotate270().fliph(),
         Orientation::Rotate270 => image.rotate270(),
     }
 }
@@ -3427,4 +3427,47 @@ pub fn calculate_auto_adjustments(
     let results = perform_auto_analysis(&original_image);
 
     Ok(auto_results_to_json(&results))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{Rgb, RgbImage};
+
+    fn asymmetric_fixture() -> DynamicImage {
+        let mut image = RgbImage::new(2, 3);
+        for (index, pixel) in image.pixels_mut().enumerate() {
+            *pixel = Rgb([(index + 1) as u8, 0, 0]);
+        }
+        DynamicImage::ImageRgb8(image)
+    }
+
+    fn red_channel_rows(image: DynamicImage) -> Vec<Vec<u8>> {
+        let image = image.to_rgb8();
+        (0..image.height())
+            .map(|y| {
+                (0..image.width())
+                    .map(|x| image.get_pixel(x, y)[0])
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn exif_orientation_five_transposes_across_the_main_diagonal() {
+        let oriented = apply_orientation(asymmetric_fixture(), Orientation::Transpose);
+        assert_eq!(
+            red_channel_rows(oriented),
+            vec![vec![1, 3, 5], vec![2, 4, 6]]
+        );
+    }
+
+    #[test]
+    fn exif_orientation_seven_transposes_across_the_anti_diagonal() {
+        let oriented = apply_orientation(asymmetric_fixture(), Orientation::Transverse);
+        assert_eq!(
+            red_channel_rows(oriented),
+            vec![vec![6, 4, 2], vec![5, 3, 1]]
+        );
+    }
 }
