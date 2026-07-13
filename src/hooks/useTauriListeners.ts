@@ -159,6 +159,13 @@ export function useTauriListeners({
       listen('export-complete', () => {
         if (isEffectActive) useProcessStore.getState().setExportState({ status: Status.Success });
       }),
+      listen('export-complete-with-errors', () => {
+        if (isEffectActive)
+          useProcessStore.getState().setExportState({
+            status: Status.Error,
+            errorMessage: '',
+          });
+      }),
       listen('export-error', (event: any) => {
         if (isEffectActive)
           useProcessStore.getState().setExportState({

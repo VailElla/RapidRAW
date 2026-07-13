@@ -614,6 +614,10 @@ export default function ExportPanel({
   };
 
   const handleCancel = async () => {
+    // Leave the exporting state immediately. The encoder running in a
+    // spawn_blocking task may need a moment to reach its next cancellation
+    // checkpoint, so waiting for the command would make the button look stuck.
+    setExportState({ status: Status.Cancelled });
     try {
       await invoke(Invokes.CancelExport);
     } catch (error) {
