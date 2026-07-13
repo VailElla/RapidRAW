@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use image::codecs::jpeg::JpegEncoder;
 use image::{DynamicImage, GenericImageView, GrayImage, ImageBuffer, ImageFormat, Luma, imageops};
@@ -281,6 +281,72 @@ fn ensure_export_not_cancelled(cancellation_token: &AtomicBool) -> Result<(), St
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportCancellationRequest {
+    Requested,
+    AlreadyRequested,
+    NoActiveTask,
+}
+
+fn register_export_task(
+    task_token: &Mutex<Option<Arc<AtomicBool>>>,
+) -> Result<Arc<AtomicBool>, String> {
+    let mut active_token = task_token.lock().unwrap();
+    if active_token.is_some() {
+        return Err("An export is already in progress.".to_string());
+    }
+
+    let cancellation_token = Arc::new(AtomicBool::new(false));
+    *active_token = Some(Arc::clone(&cancellation_token));
+    Ok(cancellation_token)
+}
+
+fn request_export_cancellation<F>(
+    task_token: &Mutex<Option<Arc<AtomicBool>>>,
+    on_requested: F,
+) -> ExportCancellationRequest
+where
+    F: FnOnce(),
+{
+    let active_token = task_token.lock().unwrap();
+    let Some(cancellation_token) = active_token.as_ref() else {
+        return ExportCancellationRequest::NoActiveTask;
+    };
+
+    if cancellation_token.swap(true, Ordering::SeqCst) {
+        ExportCancellationRequest::AlreadyRequested
+    } else {
+        // Keep the task slot locked until the terminal event is emitted so a new
+        // export cannot receive a late cancellation event from the previous one.
+        on_requested();
+        ExportCancellationRequest::Requested
+    }
+}
+
+fn finish_export_task<F>(
+    task_token: &Mutex<Option<Arc<AtomicBool>>>,
+    cancellation_token: &Arc<AtomicBool>,
+    on_finish: F,
+) -> bool
+where
+    F: FnOnce(bool),
+{
+    let mut active_token = task_token.lock().unwrap();
+    let Some(current_token) = active_token.as_ref() else {
+        return false;
+    };
+    if !Arc::ptr_eq(current_token, cancellation_token) {
+        return false;
+    }
+
+    let cancelled = cancellation_token.load(Ordering::SeqCst);
+    // Emit the terminal event before releasing the task slot. This serializes
+    // completion against both cancellation and the next export registration.
+    on_finish(cancelled);
+    *active_token = None;
+    true
+}
+
 #[allow(clippy::too_many_arguments)]
 fn process_image_for_export_pipeline(
     path: &str,
@@ -550,9 +616,12 @@ fn export_masks_for_image(
     state: &tauri::State<AppState>,
     is_raw: bool,
     app_handle: &tauri::AppHandle,
+    cancellation_token: &AtomicBool,
 ) -> Result<(), String> {
+    ensure_export_not_cancelled(cancellation_token)?;
     let (transformed_image, unscaled_crop_offset) =
         apply_all_transformations(Cow::Borrowed(base_image), js_adjustments);
+    ensure_export_not_cancelled(cancellation_token)?;
     let (img_w, img_h) = transformed_image.dimensions();
     let mask_definitions: Vec<MaskDefinition> = js_adjustments
         .get("masks")
@@ -560,19 +629,21 @@ fn export_masks_for_image(
         .unwrap_or_default();
 
     let warped_image = resolve_warped_image_for_masks(state, js_adjustments, &mask_definitions);
-    let mask_bitmaps: Vec<ImageBuffer<Luma<u8>, Vec<u8>>> = mask_definitions
-        .iter()
-        .filter_map(|def| {
-            generate_mask_bitmap(
-                def,
-                img_w,
-                img_h,
-                1.0,
-                unscaled_crop_offset,
-                warped_image.as_deref(),
-            )
-        })
-        .collect();
+    let mut mask_bitmaps = Vec::with_capacity(mask_definitions.len());
+    for definition in &mask_definitions {
+        ensure_export_not_cancelled(cancellation_token)?;
+        if let Some(bitmap) = generate_mask_bitmap(
+            definition,
+            img_w,
+            img_h,
+            1.0,
+            unscaled_crop_offset,
+            warped_image.as_deref(),
+        ) {
+            mask_bitmaps.push(bitmap);
+        }
+        ensure_export_not_cancelled(cancellation_token)?;
+    }
 
     if !mask_bitmaps.is_empty() {
         let tm_override = resolve_tonemapper_override_from_handle(app_handle, is_raw);
@@ -591,6 +662,7 @@ fn export_masks_for_image(
             .unwrap_or("jpg");
 
         for (i, _) in mask_bitmaps.iter().enumerate() {
+            ensure_export_not_cancelled(cancellation_token)?;
             let single_adjustments = build_single_mask_adjustments(&all_adjustments, i);
             let full_white_mask = ImageBuffer::from_fn(img_w, img_h, |_, _| Luma([255u8]));
             let single_bitmaps: Vec<ImageBuffer<Luma<u8>, Vec<u8>>> = vec![full_white_mask];
@@ -608,6 +680,7 @@ fn export_masks_for_image(
                 },
                 "export_mask_image",
             )?;
+            ensure_export_not_cancelled(cancellation_token)?;
 
             let with_options = apply_export_resize_and_watermark(processed, export_settings)?;
             let (out_w, out_h) = with_options.dimensions();
@@ -618,6 +691,7 @@ fn export_masks_for_image(
                 out_h,
                 imageops::FilterType::Lanczos3,
             );
+            ensure_export_not_cancelled(cancellation_token)?;
 
             let mask_image_path =
                 output_dir.join(format!("{}_mask_{}_image.{}", stem, i, extension));
@@ -629,12 +703,14 @@ fn export_masks_for_image(
                 source_path_str,
                 export_settings,
             )?;
+            ensure_export_not_cancelled(cancellation_token)?;
 
             if export_settings.preserve_timestamps {
                 set_timestamps_from_exif(Path::new(source_path_str), &mask_image_path);
             }
 
             let alpha_bytes = encode_grayscale_to_png(&alpha_resized)?;
+            ensure_export_not_cancelled(cancellation_token)?;
             #[cfg(target_os = "android")]
             {
                 let file_name = mask_alpha_path
@@ -650,6 +726,7 @@ fn export_masks_for_image(
 
             #[cfg(not(target_os = "android"))]
             fs::write(&mask_alpha_path, alpha_bytes).map_err(|e| e.to_string())?;
+            ensure_export_not_cancelled(cancellation_token)?;
         }
     }
     Ok(())
@@ -661,7 +738,9 @@ fn export_adjustments_as_lut(
     context: &Arc<GpuContext>,
     state: &tauri::State<AppState>,
     app_handle: &tauri::AppHandle,
+    cancellation_token: &AtomicBool,
 ) -> Result<Vec<u8>, String> {
+    ensure_export_not_cancelled(cancellation_token)?;
     let lut_size = 33;
     let identity_image = generate_identity_lut_image(lut_size);
 
@@ -701,25 +780,11 @@ fn export_adjustments_as_lut(
         },
         "export_lut",
     )?;
+    ensure_export_not_cancelled(cancellation_token)?;
 
-    convert_image_to_cube_lut(&processed_lut, lut_size)
-}
-
-struct ExportHandleGuard {
-    app_handle: tauri::AppHandle,
-}
-
-impl Drop for ExportHandleGuard {
-    fn drop(&mut self) {
-        if let Ok(mut handle_lock) = self
-            .app_handle
-            .state::<AppState>()
-            .export_task_handle
-            .lock()
-        {
-            *handle_lock = None;
-        }
-    }
+    let cube_lut = convert_image_to_cube_lut(&processed_lut, lut_size)?;
+    ensure_export_not_cancelled(cancellation_token)?;
+    Ok(cube_lut)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -736,19 +801,34 @@ pub async fn export_images(
     state: tauri::State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
+    let cancellation_token = register_export_task(&state.export_task_token)?;
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-    if state.export_task_handle.lock().unwrap().is_some() {
-        return Err("An export is already in progress.".to_string());
+    if cancellation_token.load(Ordering::SeqCst) {
+        finish_export_task(&state.export_task_token, &cancellation_token, |_| {});
+        return Ok(());
     }
-    state
-        .export_cancellation_token
-        .store(false, Ordering::SeqCst);
 
-    let context = get_or_init_gpu_context(&state, &app_handle)?;
+    let context = match get_or_init_gpu_context(&state, &app_handle) {
+        Ok(context) => context,
+        Err(error) => {
+            let mut cancelled = false;
+            finish_export_task(
+                &state.export_task_token,
+                &cancellation_token,
+                |was_cancelled| cancelled = was_cancelled,
+            );
+            return if cancelled { Ok(()) } else { Err(error) };
+        }
+    };
+
+    if cancellation_token.load(Ordering::SeqCst) {
+        finish_export_task(&state.export_task_token, &cancellation_token, |_| {});
+        return Ok(());
+    }
+
     let context = Arc::new(context);
     let progress_counter = Arc::new(AtomicUsize::new(0));
-    let cancellation_token = Arc::clone(&state.export_cancellation_token);
 
     let available_cores = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -774,10 +854,7 @@ pub async fn export_images(
         num_threads
     );
 
-    let task = tokio::spawn(async move {
-        let _export_guard = ExportHandleGuard {
-            app_handle: app_handle.clone(),
-        };
+    let _export_task = tokio::spawn(async move {
         let output_folder_path = std::path::Path::new(&output_folder_or_file);
         let total_paths = paths.len();
         let settings = load_settings(app_handle.clone()).unwrap_or_default();
@@ -908,7 +985,9 @@ pub async fn export_images(
                             &context_clone,
                             &state,
                             &app_handle_clone,
+                            &cancellation_token_clone,
                         )?;
+                        ensure_export_not_cancelled(&cancellation_token_clone)?;
                         #[cfg(target_os = "android")]
                         {
                             let file_name = output_path
@@ -923,6 +1002,7 @@ pub async fn export_images(
                         }
                         #[cfg(not(target_os = "android"))]
                         fs::write(&output_path, cube_bytes).map_err(|e| e.to_string())?;
+                        ensure_export_not_cancelled(&cancellation_token_clone)?;
                         return Ok(());
                     }
 
@@ -1003,6 +1083,7 @@ pub async fn export_images(
                     if export_settings.preserve_timestamps {
                         set_timestamps_from_exif(Path::new(&source_path_str), &output_path);
                     }
+                    ensure_export_not_cancelled(&cancellation_token_clone)?;
 
                     if export_settings.export_masks {
                         export_masks_for_image(
@@ -1015,6 +1096,7 @@ pub async fn export_images(
                             &state,
                             is_raw,
                             &app_handle_clone,
+                            &cancellation_token_clone,
                         )?;
                     }
 
@@ -1055,36 +1137,45 @@ pub async fn export_images(
 
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
-        if cancellation_token.load(Ordering::SeqCst) {
-            log::info!("Batch export cancelled and worker cleanup completed");
-        } else {
-            let mut error_count = 0;
-            for result in results {
-                if let Err(e) = result {
-                    error_count += 1;
-                    log::error!("Export error: {}", e);
+        let errors: Vec<String> = results.into_iter().filter_map(Result::err).collect();
+        let error_count = errors.len();
+        let export_state = app_handle.state::<AppState>();
+        let finalized = finish_export_task(
+            &export_state.export_task_token,
+            &cancellation_token,
+            |cancelled| {
+                if cancelled {
+                    log::info!("Batch export cancelled and worker cleanup completed");
+                    return;
+                }
+
+                for error in &errors {
+                    log::error!("Export error: {}", error);
                     if total_paths == 1 {
-                        let _ = app_handle.emit("export-error", e);
+                        let _ = app_handle.emit("export-error", error.clone());
                     }
                 }
-            }
 
-            if error_count > 0 && total_paths > 1 {
-                let _ = app_handle.emit(
-                    "export-complete-with-errors",
-                    serde_json::json!({ "errors": error_count, "total": total_paths }),
-                );
-            } else if error_count == 0 {
-                let _ = app_handle.emit(
-                    "batch-export-progress",
-                    serde_json::json!({ "current": total_paths, "total": total_paths, "path": "" }),
-                );
-                let _ = app_handle.emit("export-complete", ());
-            }
+                if error_count > 0 && total_paths > 1 {
+                    let _ = app_handle.emit(
+                        "export-error",
+                        format!("{error_count} of {total_paths} exports failed"),
+                    );
+                } else if error_count == 0 {
+                    let _ = app_handle.emit(
+                        "batch-export-progress",
+                        serde_json::json!({ "current": total_paths, "total": total_paths, "path": "" }),
+                    );
+                    let _ = app_handle.emit("export-complete", ());
+                }
+            },
+        );
+
+        if !finalized {
+            log::warn!("Ignoring terminal events from a stale export task");
         }
     });
 
-    *state.export_task_handle.lock().unwrap() = Some(task);
     Ok(())
 }
 
@@ -1093,14 +1184,19 @@ pub fn cancel_export(
     state: tauri::State<AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
-    let task_is_active = state.export_task_handle.lock().unwrap().is_some();
-    state
-        .export_cancellation_token
-        .store(true, Ordering::SeqCst);
-    let _ = app_handle.emit("export-cancelled", ());
-    log::info!(
-        "Export cancellation requested (active_task={task_is_active}); workers will stop at the next checkpoint"
-    );
+    match request_export_cancellation(&state.export_task_token, || {
+        let _ = app_handle.emit("export-cancelled", ());
+    }) {
+        ExportCancellationRequest::Requested => {
+            log::info!("Export cancellation requested; workers will stop at the next checkpoint");
+        }
+        ExportCancellationRequest::AlreadyRequested => {
+            log::info!("Export cancellation was already requested");
+        }
+        ExportCancellationRequest::NoActiveTask => {
+            log::info!("Ignoring export cancellation because no export is active");
+        }
+    }
     Ok(())
 }
 
@@ -1408,5 +1504,93 @@ mod tests {
             ensure_export_not_cancelled(&cancellation_token).unwrap_err(),
             "Export cancelled"
         );
+    }
+
+    #[test]
+    fn cancellation_requested_during_startup_is_preserved_and_emitted_once() {
+        let task_token = Mutex::new(None);
+        let cancellation_token = register_export_task(&task_token).unwrap();
+        let emitted_count = AtomicUsize::new(0);
+
+        assert_eq!(
+            request_export_cancellation(&task_token, || {
+                emitted_count.fetch_add(1, Ordering::SeqCst);
+            }),
+            ExportCancellationRequest::Requested
+        );
+        assert!(cancellation_token.load(Ordering::SeqCst));
+
+        assert_eq!(
+            request_export_cancellation(&task_token, || {
+                emitted_count.fetch_add(1, Ordering::SeqCst);
+            }),
+            ExportCancellationRequest::AlreadyRequested
+        );
+        assert_eq!(emitted_count.load(Ordering::SeqCst), 1);
+
+        let mut finalized_as_cancelled = false;
+        assert!(finish_export_task(
+            &task_token,
+            &cancellation_token,
+            |cancelled| finalized_as_cancelled = cancelled,
+        ));
+        assert!(finalized_as_cancelled);
+        assert!(task_token.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn completion_prevents_a_late_cancellation_event() {
+        let task_token = Mutex::new(None);
+        let cancellation_token = register_export_task(&task_token).unwrap();
+        let completed_count = AtomicUsize::new(0);
+        let cancelled_count = AtomicUsize::new(0);
+
+        assert!(finish_export_task(
+            &task_token,
+            &cancellation_token,
+            |cancelled| {
+                assert!(!cancelled);
+                completed_count.fetch_add(1, Ordering::SeqCst);
+            },
+        ));
+        assert_eq!(
+            request_export_cancellation(&task_token, || {
+                cancelled_count.fetch_add(1, Ordering::SeqCst);
+            }),
+            ExportCancellationRequest::NoActiveTask
+        );
+        assert_eq!(completed_count.load(Ordering::SeqCst), 1);
+        assert_eq!(cancelled_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn overlapping_export_registration_is_rejected() {
+        let task_token = Mutex::new(None);
+        let cancellation_token = register_export_task(&task_token).unwrap();
+
+        assert_eq!(
+            register_export_task(&task_token).unwrap_err(),
+            "An export is already in progress."
+        );
+        assert!(finish_export_task(&task_token, &cancellation_token, |_| {},));
+        assert!(register_export_task(&task_token).is_ok());
+    }
+
+    #[test]
+    fn stale_export_cannot_clear_or_complete_a_newer_task() {
+        let task_token = Mutex::new(None);
+        let stale_token = register_export_task(&task_token).unwrap();
+        let current_token = Arc::new(AtomicBool::new(false));
+        *task_token.lock().unwrap() = Some(Arc::clone(&current_token));
+        let stale_terminal_count = AtomicUsize::new(0);
+
+        assert!(!finish_export_task(&task_token, &stale_token, |_| {
+            stale_terminal_count.fetch_add(1, Ordering::SeqCst);
+        },));
+        assert_eq!(stale_terminal_count.load(Ordering::SeqCst), 0);
+        assert!(Arc::ptr_eq(
+            task_token.lock().unwrap().as_ref().unwrap(),
+            &current_token
+        ));
     }
 }
