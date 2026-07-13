@@ -57,6 +57,8 @@ pub struct ImageMetadata {
     pub tags: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exif: Option<std::collections::HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exif_overrides: Option<std::collections::HashMap<String, Option<String>>>,
 }
 
 impl Default for ImageMetadata {
@@ -67,6 +69,7 @@ impl Default for ImageMetadata {
             adjustments: Value::Null,
             tags: None,
             exif: None,
+            exif_overrides: None,
         }
     }
 }

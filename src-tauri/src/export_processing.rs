@@ -1,16 +1,18 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use image::codecs::jpeg::JpegEncoder;
 use image::{DynamicImage, GenericImageView, GrayImage, ImageBuffer, ImageFormat, Luma, imageops};
-use jxl_encoder::{LosslessConfig, LossyConfig, PixelLayout};
+use jxl_encoder::{ImageMetadata as JxlImageMetadata, LosslessConfig, LossyConfig, PixelLayout};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tauri::Emitter;
 use tauri::Manager;
 
@@ -26,7 +28,7 @@ use crate::image_loader::{
 use crate::image_processing::{
     AllAdjustments, Crop, GpuContext, RenderRequest, downscale_f32_image,
     get_all_adjustments_from_json, get_or_init_gpu_context, process_and_get_dynamic_image,
-    resolve_tonemapper_override_from_handle,
+    process_and_get_high_precision_dynamic_image, resolve_tonemapper_override_from_handle,
 };
 use crate::lut_processing::{
     convert_image_to_cube_lut, generate_identity_lut_image, get_or_load_lut,
@@ -60,6 +62,10 @@ pub struct ResizeOptions {
 #[serde(rename_all = "camelCase")]
 pub struct ExportSettings {
     pub jpeg_quality: u8,
+    #[serde(default = "default_jxl_bit_depth")]
+    pub jxl_bit_depth: u8,
+    #[serde(default = "default_jxl_effort")]
+    pub jxl_effort: u8,
     pub resize: Option<ResizeOptions>,
     pub keep_metadata: bool,
     #[serde(default)]
@@ -71,6 +77,14 @@ pub struct ExportSettings {
     pub export_masks: bool,
     #[serde(default)]
     pub preserve_folders: bool,
+}
+
+const fn default_jxl_bit_depth() -> u8 {
+    8
+}
+
+const fn default_jxl_effort() -> u8 {
+    5
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -124,10 +138,8 @@ fn apply_watermark(
     for pixel in scaled_watermark_rgba.pixels_mut() {
         pixel[3] = (pixel[3] as f32 * opacity_factor) as u8;
     }
-    let final_watermark = DynamicImage::ImageRgba8(scaled_watermark_rgba);
-
     let spacing_pixels = (base_min_dim * (watermark_settings.spacing / 100.0)) as i64;
-    let (wm_w, wm_h) = final_watermark.dimensions();
+    let (wm_w, wm_h) = scaled_watermark_rgba.dimensions();
 
     let x = match watermark_settings.anchor {
         WatermarkAnchor::TopLeft | WatermarkAnchor::CenterLeft | WatermarkAnchor::BottomLeft => {
@@ -153,7 +165,64 @@ fn apply_watermark(
         | WatermarkAnchor::BottomRight => base_h as i64 - wm_h as i64 - spacing_pixels,
     };
 
-    image::imageops::overlay(base_image, &final_watermark, x, y);
+    match base_image {
+        DynamicImage::ImageRgb32F(base) => {
+            for (source_x, source_y, source) in scaled_watermark_rgba.enumerate_pixels() {
+                let destination_x = x + source_x as i64;
+                let destination_y = y + source_y as i64;
+                if destination_x < 0
+                    || destination_y < 0
+                    || destination_x >= base.width() as i64
+                    || destination_y >= base.height() as i64
+                {
+                    continue;
+                }
+
+                let alpha = source[3] as f32 / u8::MAX as f32;
+                let inverse_alpha = 1.0 - alpha;
+                let destination = base.get_pixel_mut(destination_x as u32, destination_y as u32);
+                for channel in 0..3 {
+                    let source_value = source[channel] as f32 / u8::MAX as f32;
+                    destination[channel] =
+                        source_value * alpha + destination[channel] * inverse_alpha;
+                }
+            }
+        }
+        DynamicImage::ImageRgba32F(base) => {
+            for (source_x, source_y, source) in scaled_watermark_rgba.enumerate_pixels() {
+                let destination_x = x + source_x as i64;
+                let destination_y = y + source_y as i64;
+                if destination_x < 0
+                    || destination_y < 0
+                    || destination_x >= base.width() as i64
+                    || destination_y >= base.height() as i64
+                {
+                    continue;
+                }
+
+                let source_alpha = source[3] as f32 / u8::MAX as f32;
+                let destination = base.get_pixel_mut(destination_x as u32, destination_y as u32);
+                let destination_alpha = destination[3].clamp(0.0, 1.0);
+                let output_alpha = source_alpha + destination_alpha * (1.0 - source_alpha);
+
+                for channel in 0..3 {
+                    let source_value = source[channel] as f32 / u8::MAX as f32;
+                    destination[channel] = if output_alpha > 0.0 {
+                        (source_value * source_alpha
+                            + destination[channel] * destination_alpha * (1.0 - source_alpha))
+                            / output_alpha
+                    } else {
+                        0.0
+                    };
+                }
+                destination[3] = output_alpha;
+            }
+        }
+        _ => {
+            let final_watermark = DynamicImage::ImageRgba8(scaled_watermark_rgba);
+            image::imageops::overlay(base_image, &final_watermark, x, y);
+        }
+    }
 
     Ok(())
 }
@@ -258,18 +327,31 @@ fn apply_export_resize_and_watermark(
     mut image: DynamicImage,
     export_settings: &ExportSettings,
 ) -> Result<DynamicImage, String> {
+    let resize_started = Instant::now();
+    let mut resized = false;
     if let Some(resize_opts) = &export_settings.resize {
         let (current_w, current_h) = image.dimensions();
         let (target_w, target_h) = calculate_resize_target(current_w, current_h, resize_opts);
 
         if target_w != current_w || target_h != current_h {
             image = image.resize(target_w, target_h, imageops::FilterType::Lanczos3);
+            resized = true;
         }
     }
+    log::info!(
+        "Export stage resize (applied={resized}) took {:?}",
+        resize_started.elapsed()
+    );
 
+    let watermark_started = Instant::now();
     if let Some(watermark_settings) = &export_settings.watermark {
         apply_watermark(&mut image, watermark_settings)?;
     }
+    log::info!(
+        "Export stage watermark (applied={}) took {:?}",
+        export_settings.watermark.is_some(),
+        watermark_started.elapsed()
+    );
     Ok(image)
 }
 
@@ -281,6 +363,7 @@ fn process_image_for_export_pipeline(
     context: &GpuContext,
     state: &tauri::State<AppState>,
     is_raw: bool,
+    high_precision: bool,
     debug_tag: &str,
     app_handle: &tauri::AppHandle,
 ) -> Result<DynamicImage, String> {
@@ -317,19 +400,31 @@ fn process_image_for_export_pipeline(
 
     let unique_hash = calculate_full_job_hash(path, js_adjustments);
 
-    process_and_get_dynamic_image(
-        context,
-        state,
-        transformed_image.as_ref(),
-        unique_hash,
-        RenderRequest {
-            adjustments: all_adjustments,
-            mask_bitmaps: &mask_bitmaps,
-            lut,
-            roi: None,
-        },
-        debug_tag,
-    )
+    let request = RenderRequest {
+        adjustments: all_adjustments,
+        mask_bitmaps: &mask_bitmaps,
+        lut,
+        roi: None,
+    };
+    if high_precision {
+        process_and_get_high_precision_dynamic_image(
+            context,
+            state,
+            transformed_image.as_ref(),
+            unique_hash,
+            request,
+            debug_tag,
+        )
+    } else {
+        process_and_get_dynamic_image(
+            context,
+            state,
+            transformed_image.as_ref(),
+            unique_hash,
+            request,
+            debug_tag,
+        )
+    }
 }
 
 fn set_timestamps_from_exif(src: &Path, dst: &Path) {
@@ -343,28 +438,510 @@ fn set_timestamps_from_exif(src: &Path, dst: &Path) {
     }
 }
 
+const MIB: u64 = 1024 * 1024;
+const GIB: u64 = 1024 * MIB;
+const MIN_EXPORT_TASK_BYTES: u64 = 5 * GIB / 2;
+const EXPORT_TASK_FIXED_BYTES: u64 = 512 * MIB;
+const JXL16_EXPORT_BYTES_PER_PIXEL: u64 = 72;
+const STANDARD_EXPORT_BYTES_PER_PIXEL: u64 = 40;
+const UNKNOWN_JXL16_PIXELS: u64 = 200_000_000;
+const UNKNOWN_STANDARD_PIXELS: u64 = 50_000_000;
+
+fn source_pixel_count(path: &Path) -> Option<u64> {
+    if let Ok((width, height)) = image::image_dimensions(path) {
+        return u64::from(width).checked_mul(u64::from(height));
+    }
+
+    if !is_raw_file(path) {
+        return None;
+    }
+
+    if let Some(failure) = crate::image_loader::cached_raw_decode_failure_for_path(path) {
+        log::warn!(
+            "Skipping RAW dimension probe for cached failure '{}': {}",
+            path.display(),
+            failure
+        );
+        return None;
+    }
+    if crate::image_loader::cached_raw_dimension_failure_for_path(path) {
+        log::warn!(
+            "Skipping cached RAW dimension probe panic for '{}'",
+            path.display()
+        );
+        return None;
+    }
+
+    // `dummy=true` asks rawler for the structural RAW image without unpacking
+    // its full pixel payload. The file mapping is read-only and short-lived.
+    let mapped = read_file_mapped(path).ok()?;
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let source = rawler::rawsource::RawSource::new_from_slice(&mapped);
+        let decoder = rawler::get_decoder(&source).ok()?;
+        let raw = decoder
+            .raw_image(&source, &rawler::decoders::RawDecodeParams::default(), true)
+            .ok()?;
+        u64::try_from(raw.width)
+            .ok()?
+            .checked_mul(u64::try_from(raw.height).ok()?)
+    })) {
+        Ok(pixel_count) => pixel_count,
+        Err(_) => {
+            crate::image_loader::remember_raw_dimension_panic_for_path(path);
+            log::warn!("RAW dimension probe panicked for '{}'", path.display());
+            None
+        }
+    }
+}
+
+fn largest_export_pixel_count(paths: &[String], jxl16: bool) -> (u64, bool) {
+    let unknown_pixels = if jxl16 {
+        UNKNOWN_JXL16_PIXELS
+    } else {
+        UNKNOWN_STANDARD_PIXELS
+    };
+    let mut used_fallback = false;
+    let largest = paths
+        .iter()
+        .map(|path| {
+            let (source_path, _) = parse_virtual_path(path);
+            source_pixel_count(&source_path).unwrap_or_else(|| {
+                used_fallback = true;
+                unknown_pixels
+            })
+        })
+        .max()
+        .unwrap_or(unknown_pixels);
+    (largest.max(1), used_fallback)
+}
+
+fn estimated_export_task_bytes(pixel_count: u64, jxl16: bool) -> u64 {
+    let bytes_per_pixel = if jxl16 {
+        JXL16_EXPORT_BYTES_PER_PIXEL
+    } else {
+        STANDARD_EXPORT_BYTES_PER_PIXEL
+    };
+    EXPORT_TASK_FIXED_BYTES
+        .saturating_add(pixel_count.saturating_mul(bytes_per_pixel))
+        .max(MIN_EXPORT_TASK_BYTES)
+}
+
+fn memory_limited_export_threads(
+    path_count: usize,
+    available_cores: usize,
+    available_memory: u64,
+    pixel_count: u64,
+    jxl16: bool,
+) -> Result<(usize, u64, u64), String> {
+    let per_task = estimated_export_task_bytes(pixel_count, jxl16);
+    // Preserve headroom for the UI, OS, encoder output and allocator/GPU
+    // variance that the byte-per-pixel model cannot observe.
+    let memory_budget = available_memory.saturating_mul(85) / 100;
+    let memory_limit = memory_budget / per_task;
+    if jxl16 && memory_limit == 0 {
+        return Err(format!(
+            "Insufficient free memory for {:.1} MP 16-bit JXL export: estimated {:.1} GiB task peak, {:.1} GiB safe budget",
+            pixel_count as f64 / 1_000_000.0,
+            per_task as f64 / GIB as f64,
+            memory_budget as f64 / GIB as f64,
+        ));
+    }
+
+    let threads = path_count
+        .max(1)
+        .min(available_cores.max(1))
+        .min(memory_limit.max(1) as usize)
+        .min(16);
+    Ok((threads, per_task, memory_budget))
+}
+
+fn normalize_jxl_alpha_semantics(image: DynamicImage, source_uses_alpha: bool) -> DynamicImage {
+    if source_uses_alpha {
+        image
+    } else {
+        match image {
+            DynamicImage::ImageRgba8(buffer) => {
+                DynamicImage::ImageRgb8(DynamicImage::ImageRgba8(buffer).to_rgb8())
+            }
+            DynamicImage::ImageRgba16(buffer) => {
+                DynamicImage::ImageRgb16(DynamicImage::ImageRgba16(buffer).to_rgb16())
+            }
+            DynamicImage::ImageRgba32F(buffer) => {
+                DynamicImage::ImageRgb32F(DynamicImage::ImageRgba32F(buffer).to_rgb32f())
+            }
+            other => other,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum SemanticExifValue {
+    Byte(Vec<u8>),
+    Ascii(Vec<Vec<u8>>),
+    Short(Vec<u16>),
+    Long(Vec<u32>),
+    Rational(Vec<(u32, u32)>),
+    SByte(Vec<i8>),
+    Undefined(Vec<u8>),
+    SShort(Vec<i16>),
+    SLong(Vec<i32>),
+    SRational(Vec<(i32, i32)>),
+    Float(Vec<u32>),
+    Double(Vec<u64>),
+}
+
+fn semantic_exif_value(value: &exif::Value) -> Result<SemanticExifValue, String> {
+    Ok(match value {
+        exif::Value::Byte(values) => SemanticExifValue::Byte(values.clone()),
+        exif::Value::Ascii(values) => SemanticExifValue::Ascii(values.clone()),
+        exif::Value::Short(values) => SemanticExifValue::Short(values.clone()),
+        exif::Value::Long(values) => SemanticExifValue::Long(values.clone()),
+        exif::Value::Rational(values) => SemanticExifValue::Rational(
+            values
+                .iter()
+                .map(|value| (value.num, value.denom))
+                .collect(),
+        ),
+        exif::Value::SByte(values) => SemanticExifValue::SByte(values.clone()),
+        // The second Undefined member is the source-buffer offset. It is a
+        // serialization detail, not part of the EXIF value.
+        exif::Value::Undefined(values, _) => SemanticExifValue::Undefined(values.clone()),
+        exif::Value::SShort(values) => SemanticExifValue::SShort(values.clone()),
+        exif::Value::SLong(values) => SemanticExifValue::SLong(values.clone()),
+        exif::Value::SRational(values) => SemanticExifValue::SRational(
+            values
+                .iter()
+                .map(|value| (value.num, value.denom))
+                .collect(),
+        ),
+        exif::Value::Float(values) => {
+            SemanticExifValue::Float(values.iter().map(|value| value.to_bits()).collect())
+        }
+        exif::Value::Double(values) => {
+            SemanticExifValue::Double(values.iter().map(|value| value.to_bits()).collect())
+        }
+        exif::Value::Unknown(_, _, _) => {
+            return Err("JXL EXIF contains an unsupported unknown value type".to_string());
+        }
+    })
+}
+
+fn semantic_exif_fields(
+    exif: &exif::Exif,
+) -> Result<BTreeMap<(u16, exif::Tag), Vec<SemanticExifValue>>, String> {
+    let mut fields = BTreeMap::new();
+    for field in exif.fields() {
+        fields
+            .entry((field.ifd_num.index(), field.tag))
+            .or_insert_with(Vec::new)
+            .push(semantic_exif_value(&field.value)?);
+    }
+    for values in fields.values_mut() {
+        values.sort_unstable();
+    }
+    Ok(fields)
+}
+
+fn short_sha256(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    hex::encode(&digest[..8])
+}
+
+/// Returns the complete TIFF payload from the first Exif box in a JXL
+/// container. The Exif box is commonly placed after the codestream. Image
+/// decoders are allowed to stop once that codestream is complete, so their
+/// auxiliary-box view can contain only the prefix that happened to share the
+/// final input buffer. Walking the ISO BMFF boxes by their declared sizes keeps
+/// metadata verification independent of that decoder buffering detail.
+fn extract_jxl_exif_tiff(image_bytes: &[u8]) -> Result<Option<&[u8]>, String> {
+    let mut position = 0usize;
+
+    while position < image_bytes.len() {
+        let header = image_bytes
+            .get(position..position.saturating_add(8))
+            .ok_or_else(|| "JXL container has a truncated box header".to_string())?;
+        let size32 = u32::from_be_bytes(header[..4].try_into().unwrap());
+        let box_type = &header[4..8];
+        let (header_size, box_size) = match size32 {
+            0 => (8usize, image_bytes.len() - position),
+            1 => {
+                let extended = image_bytes
+                    .get(position + 8..position + 16)
+                    .ok_or_else(|| {
+                        "JXL container has a truncated extended box header".to_string()
+                    })?;
+                let size = u64::from_be_bytes(extended.try_into().unwrap());
+                let size = usize::try_from(size)
+                    .map_err(|_| "JXL container box is too large".to_string())?;
+                (16usize, size)
+            }
+            size => (8usize, size as usize),
+        };
+
+        if box_size < header_size {
+            return Err("JXL container has an invalid box size".to_string());
+        }
+        let box_end = position
+            .checked_add(box_size)
+            .filter(|end| *end <= image_bytes.len())
+            .ok_or_else(|| "JXL container has a truncated box payload".to_string())?;
+
+        if box_type == b"Exif" {
+            let payload = &image_bytes[position + header_size..box_end];
+            let offset_bytes = payload
+                .get(..4)
+                .ok_or_else(|| "JXL Exif box is missing its TIFF offset".to_string())?;
+            let offset = u32::from_be_bytes(offset_bytes.try_into().unwrap()) as usize;
+            let tiff_payload = &payload[4..];
+            let tiff = tiff_payload
+                .get(offset..)
+                .ok_or_else(|| "JXL Exif TIFF offset is invalid".to_string())?;
+            return Ok(Some(tiff));
+        }
+
+        position = box_end;
+        if size32 == 0 {
+            break;
+        }
+    }
+
+    Ok(None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_jxl_export(
+    image_bytes: &[u8],
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    samples_per_pixel: u8,
+    keep_metadata: bool,
+    strip_gps: bool,
+    expected_exif_tiff: Option<&[u8]>,
+) -> Result<(), String> {
+    const CONTAINER_SIGNATURE: [u8; 12] = [
+        0x00, 0x00, 0x00, 0x0c, b'J', b'X', b'L', b' ', 0x0d, 0x0a, 0x87, 0x0a,
+    ];
+    const CODESTREAM_SIGNATURE: [u8; 2] = [0xff, 0x0a];
+
+    if keep_metadata {
+        if !image_bytes.starts_with(&CONTAINER_SIGNATURE) {
+            return Err("JXL metadata export is not a valid container".to_string());
+        }
+    } else if !image_bytes.starts_with(&CODESTREAM_SIGNATURE)
+        && !image_bytes.starts_with(&CONTAINER_SIGNATURE)
+    {
+        return Err("JXL export has an invalid signature".to_string());
+    }
+
+    let decoded = jxl_oxide::JxlImage::read_with_defaults(Cursor::new(image_bytes))
+        .map_err(|error| format!("Failed to verify JXL header: {error}"))?;
+    if decoded.width() != width || decoded.height() != height {
+        return Err(format!(
+            "JXL dimension verification failed: expected {width}x{height}, got {}x{}",
+            decoded.width(),
+            decoded.height()
+        ));
+    }
+    let actual_bit_depth = decoded.image_header().metadata.bit_depth.bits_per_sample();
+    if actual_bit_depth != u32::from(bit_depth) {
+        return Err(format!(
+            "JXL bit-depth verification failed: expected {bit_depth}, got {actual_bit_depth}"
+        ));
+    }
+    let pixel_format = decoded.pixel_format();
+    let expected_alpha = samples_per_pixel == 4;
+    if pixel_format.has_alpha() != expected_alpha {
+        return Err(format!(
+            "JXL alpha verification failed: expected alpha={expected_alpha}, got alpha={}",
+            pixel_format.has_alpha()
+        ));
+    }
+    let actual_samples = pixel_format.channels();
+    if actual_samples != usize::from(samples_per_pixel) {
+        return Err(format!(
+            "JXL channel verification failed: expected {samples_per_pixel}, got {actual_samples}"
+        ));
+    }
+    if decoded.image_header().metadata.orientation != 1 {
+        return Err("JXL codestream Orientation is not 1".to_string());
+    }
+
+    let exif_tiff = if image_bytes.starts_with(&CONTAINER_SIGNATURE) {
+        extract_jxl_exif_tiff(image_bytes)?
+    } else {
+        None
+    };
+    match (keep_metadata, exif_tiff) {
+        (false, None) => Ok(()),
+        (false, Some(_)) => Err("JXL unexpectedly contains an Exif box".to_string()),
+        (true, Some(tiff)) => {
+            let expected_tiff = expected_exif_tiff
+                .ok_or_else(|| "Expected JXL EXIF TIFF payload is missing".to_string())?;
+            if tiff != expected_tiff {
+                log::warn!(
+                    "JXL EXIF payload bytes differ; validating the typed tag contract instead (expected_len={}, actual_len={}, expected_sha256={}, actual_sha256={})",
+                    expected_tiff.len(),
+                    tiff.len(),
+                    short_sha256(expected_tiff),
+                    short_sha256(tiff),
+                );
+            }
+            let exif = exif::Reader::new()
+                .read_raw(tiff.to_vec())
+                .map_err(|error| format!("Failed to reparse JXL EXIF: {error}"))?;
+            let expected_exif = exif::Reader::new()
+                .read_raw(expected_tiff.to_vec())
+                .map_err(|error| format!("Failed to reparse expected JXL EXIF: {error}"))?;
+            let actual_fields = semantic_exif_fields(&exif)?;
+            let expected_fields = semantic_exif_fields(&expected_exif)?;
+            if actual_fields != expected_fields {
+                return Err(format!(
+                    "JXL EXIF semantic verification failed: expected {} typed fields, got {}",
+                    expected_fields.len(),
+                    actual_fields.len()
+                ));
+            }
+
+            let uint_value = |tag| {
+                exif.get_field(tag, exif::In::PRIMARY)
+                    .and_then(|field| field.value.get_uint(0))
+            };
+            if uint_value(exif::Tag::ImageWidth) != Some(width)
+                || uint_value(exif::Tag::ImageLength) != Some(height)
+            {
+                return Err("JXL EXIF dimensions do not match the rendered image".to_string());
+            }
+            if uint_value(exif::Tag::SamplesPerPixel) != Some(u32::from(samples_per_pixel)) {
+                return Err("JXL EXIF SamplesPerPixel verification failed".to_string());
+            }
+            let bits = exif
+                .get_field(exif::Tag::BitsPerSample, exif::In::PRIMARY)
+                .ok_or_else(|| "JXL EXIF BitsPerSample is missing".to_string())?;
+            if (0..usize::from(samples_per_pixel))
+                .any(|index| bits.value.get_uint(index) != Some(u32::from(bit_depth)))
+            {
+                return Err("JXL EXIF BitsPerSample verification failed".to_string());
+            }
+            if uint_value(exif::Tag::Orientation) != Some(1)
+                || uint_value(exif::Tag::ColorSpace) != Some(1)
+            {
+                return Err("JXL EXIF orientation or color space verification failed".to_string());
+            }
+            let software = exif
+                .get_field(exif::Tag::Software, exif::In::PRIMARY)
+                .map(|field| field.display_value().to_string())
+                .unwrap_or_default();
+            if !software.contains("RapidRAW") {
+                return Err("JXL EXIF Software verification failed".to_string());
+            }
+
+            if strip_gps
+                && exif
+                    .fields()
+                    .any(|field| field.tag.context() == exif::Context::Gps)
+            {
+                return Err("JXL EXIF GPS stripping verification failed".to_string());
+            }
+            Ok(())
+        }
+        (true, None) => Err("JXL Exif box is missing or incomplete".to_string()),
+    }
+}
+
 fn save_image_with_metadata(
     image: &DynamicImage,
     output_path: &std::path::Path,
     source_path_str: &str,
+    source_sidecar_path: Option<&Path>,
     export_settings: &ExportSettings,
 ) -> Result<(), String> {
+    let total_started = Instant::now();
     let extension = output_path
         .extension()
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_lowercase();
 
-    let mut image_bytes = encode_image_to_bytes(image, &extension, export_settings.jpeg_quality)?;
+    let (width, height) = image.dimensions();
+    let samples_per_pixel = if image_uses_alpha_channel(image) {
+        4
+    } else {
+        3
+    };
+    let metadata_started = Instant::now();
+    let jxl_exif_tiff = if extension == "jxl" && export_settings.keep_metadata {
+        let result = exif_processing::build_jxl_exif_tiff(
+            source_path_str,
+            source_sidecar_path,
+            export_settings.strip_gps,
+            exif_processing::RenderedImageMetadata {
+                width,
+                height,
+                bits_per_sample: export_settings.jxl_bit_depth.into(),
+                samples_per_pixel: samples_per_pixel.into(),
+            },
+        );
+        log::info!(
+            "JXL export stage metadata-build for '{}' took {:?}",
+            output_path.display(),
+            metadata_started.elapsed()
+        );
+        Some(result?)
+    } else {
+        None
+    };
 
-    exif_processing::write_image_with_metadata(
-        &mut image_bytes,
-        source_path_str,
+    let encode_started = Instant::now();
+    let encoded = encode_image_to_bytes(
+        image,
         &extension,
-        export_settings.keep_metadata,
-        export_settings.strip_gps,
-    )?;
+        export_settings.jpeg_quality,
+        export_settings.jxl_bit_depth,
+        export_settings.jxl_effort,
+        jxl_exif_tiff.as_deref(),
+    );
+    if extension == "jxl" {
+        log::info!(
+            "JXL export stage encode-total for '{}' took {:?}",
+            output_path.display(),
+            encode_started.elapsed()
+        );
+    }
+    let mut image_bytes = encoded?;
 
+    if extension == "jxl" {
+        let verify_started = Instant::now();
+        let verification = verify_jxl_export(
+            &image_bytes,
+            width,
+            height,
+            export_settings.jxl_bit_depth,
+            samples_per_pixel,
+            export_settings.keep_metadata,
+            export_settings.strip_gps,
+            jxl_exif_tiff.as_deref(),
+        );
+        log::info!(
+            "JXL export stage verify for '{}' took {:?}",
+            output_path.display(),
+            verify_started.elapsed()
+        );
+        verification?;
+    } else {
+        exif_processing::write_image_with_metadata(
+            &mut image_bytes,
+            source_path_str,
+            &extension,
+            export_settings.keep_metadata,
+            export_settings.strip_gps,
+            None,
+            None,
+        )?;
+    }
+
+    let write_started = Instant::now();
+    let encoded_len = image_bytes.len();
     #[cfg(target_os = "android")]
     {
         let file_name = output_path
@@ -379,7 +956,17 @@ fn save_image_with_metadata(
     }
 
     #[cfg(not(target_os = "android"))]
-    fs::write(output_path, image_bytes).map_err(|e| e.to_string())?;
+    fs::write(output_path, &image_bytes).map_err(|e| e.to_string())?;
+
+    if extension == "jxl" {
+        log::info!(
+            "JXL export stage write for '{}' ({} bytes) took {:?}; total post-render {:?}",
+            output_path.display(),
+            encoded_len,
+            write_started.elapsed(),
+            total_started.elapsed()
+        );
+    }
 
     Ok(())
 }
@@ -407,6 +994,8 @@ fn process_image_for_export(
     context: &GpuContext,
     state: &tauri::State<AppState>,
     is_raw: bool,
+    jxl_export: bool,
+    high_precision: bool,
     app_handle: &tauri::AppHandle,
 ) -> Result<DynamicImage, String> {
     let processed_image = process_image_for_export_pipeline(
@@ -416,9 +1005,15 @@ fn process_image_for_export(
         context,
         state,
         is_raw,
+        high_precision,
         "process_image_for_export",
         app_handle,
     )?;
+    let processed_image = if jxl_export {
+        normalize_jxl_alpha_semantics(processed_image, !is_raw && base_image.color().has_alpha())
+    } else {
+        processed_image
+    };
 
     apply_export_resize_and_watermark(processed_image, export_settings)
 }
@@ -448,10 +1043,123 @@ fn encode_grayscale_to_png(bitmap: &GrayImage) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
+fn image_uses_alpha_channel(image: &DynamicImage) -> bool {
+    image.color().has_alpha()
+}
+
+/// Quantizes an sRGB unit sample for JXL integer input.
+///
+/// Finite values are clamped to `[0, 1]`, scaled to the full 16-bit range,
+/// and rounded to the nearest integer. Non-finite render output fails export
+/// rather than silently manufacturing a pixel value.
+#[inline]
+fn quantize_unit_f32_to_u16(value: f32) -> Result<u16, String> {
+    if !value.is_finite() {
+        return Err("Cannot export JXL: final image contains a non-finite sample".to_string());
+    }
+    Ok((value.clamp(0.0, 1.0) * u16::MAX as f32).round() as u16)
+}
+
+fn quantize_image_to_jxl_u16(image: &DynamicImage, has_alpha: bool) -> Result<Vec<u16>, String> {
+    match (image, has_alpha) {
+        (DynamicImage::ImageRgba32F(buffer), true) => buffer
+            .as_raw()
+            .iter()
+            .copied()
+            .map(quantize_unit_f32_to_u16)
+            .collect(),
+        (DynamicImage::ImageRgba32F(buffer), false) => buffer
+            .as_raw()
+            .chunks_exact(4)
+            .flat_map(|pixel| pixel[..3].iter().copied())
+            .map(quantize_unit_f32_to_u16)
+            .collect(),
+        (DynamicImage::ImageRgb32F(buffer), false) => buffer
+            .as_raw()
+            .iter()
+            .copied()
+            .map(quantize_unit_f32_to_u16)
+            .collect(),
+        (_, true) => Ok(image.to_rgba16().into_raw()),
+        (_, false) => Ok(image.to_rgb16().into_raw()),
+    }
+}
+
+fn encode_jxl_pixels(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    layout: PixelLayout,
+    jpeg_quality: u8,
+    jxl_effort: u8,
+    jxl_exif_tiff: Option<&[u8]>,
+) -> Result<Vec<u8>, String> {
+    let encode_started = Instant::now();
+    let (mode, effort, distance, result) = if jpeg_quality == 100 {
+        let config = LosslessConfig::new();
+        let result = if let Some(exif_tiff) = jxl_exif_tiff {
+            let metadata = JxlImageMetadata::new().with_exif(exif_tiff);
+            config
+                .encode_request(width, height, layout)
+                .with_metadata(&metadata)
+                .encode(pixels)
+                .map_err(|e| format!("Failed to encode lossless JXL: {e}"))
+        } else {
+            config
+                .encode(pixels, width, height, layout)
+                .map_err(|e| format!("Failed to encode lossless JXL: {e}"))
+        };
+        ("lossless", 7, None, result)
+    } else {
+        if !matches!(jxl_effort, 4 | 5 | 7) {
+            return Err(format!(
+                "Unsupported JXL effort {jxl_effort}; expected 4, 5, or 7"
+            ));
+        }
+        // Preserve RapidRAW's existing quality-slider mapping for lossy JXL.
+        let distance = ((100.0 - jpeg_quality as f32) / 10.0).max(0.01);
+        // `threads=0` uses the shared ambient Rayon pool. Batch exports then
+        // share one bounded pool instead of creating N dedicated pools and
+        // oversubscribing the machine.
+        let config = LossyConfig::new(distance)
+            .with_effort(jxl_effort)
+            .with_threads(0);
+        let result = if let Some(exif_tiff) = jxl_exif_tiff {
+            let metadata = JxlImageMetadata::new().with_exif(exif_tiff);
+            config
+                .encode_request(width, height, layout)
+                .with_metadata(&metadata)
+                .encode(pixels)
+                .map_err(|e| format!("Failed to encode lossy JXL: {e}"))
+        } else {
+            config
+                .encode(pixels, width, height, layout)
+                .map_err(|e| format!("Failed to encode lossy JXL: {e}"))
+        };
+        ("lossy", jxl_effort, Some(distance), result)
+    };
+
+    match &result {
+        Ok(bytes) => log::info!(
+            "JXL codec encode {width}x{height} mode={mode} effort={effort} distance={distance:?} shared_parallel=true output_bytes={} took {:?}",
+            bytes.len(),
+            encode_started.elapsed()
+        ),
+        Err(error) => log::warn!(
+            "JXL codec encode {width}x{height} mode={mode} effort={effort} distance={distance:?} failed after {:?}: {error}",
+            encode_started.elapsed()
+        ),
+    }
+    result
+}
+
 fn encode_image_to_bytes(
     image: &DynamicImage,
     output_format: &str,
     jpeg_quality: u8,
+    jxl_bit_depth: u8,
+    jxl_effort: u8,
+    jxl_exif_tiff: Option<&[u8]>,
 ) -> Result<Vec<u8>, String> {
     let mut image_bytes = Vec::new();
     let mut cursor = Cursor::new(&mut image_bytes);
@@ -459,34 +1167,75 @@ fn encode_image_to_bytes(
     match output_format.to_lowercase().as_str() {
         "jxl" => {
             let (width, height) = image.dimensions();
-            let has_alpha = image.color().has_alpha();
+            let has_alpha = image_uses_alpha_channel(image);
 
-            let jxl_data = if jpeg_quality == 100 {
-                if has_alpha {
+            let jxl_data = match (jxl_bit_depth, has_alpha) {
+                (8, true) => {
+                    let conversion_started = Instant::now();
                     let rgba = image.to_rgba8();
-                    LosslessConfig::new()
-                        .encode(rgba.as_raw(), width, height, PixelLayout::Rgba8)
-                        .map_err(|e| format!("Failed to encode lossless JXL: {}", e))?
-                } else {
-                    let rgb = image.to_rgb8();
-                    LosslessConfig::new()
-                        .encode(rgb.as_raw(), width, height, PixelLayout::Rgb8)
-                        .map_err(|e| format!("Failed to encode lossless JXL: {}", e))?
+                    log::info!(
+                        "JXL export stage pixel-conversion depth=8 channels=4 took {:?}",
+                        conversion_started.elapsed()
+                    );
+                    encode_jxl_pixels(
+                        rgba.as_raw(),
+                        width,
+                        height,
+                        PixelLayout::Rgba8,
+                        jpeg_quality,
+                        jxl_effort,
+                        jxl_exif_tiff,
+                    )?
                 }
-            } else {
-                let distance = (100.0 - jpeg_quality as f32) / 10.0;
-                let distance = distance.max(0.01);
-
-                if has_alpha {
-                    let rgba = image.to_rgba8();
-                    LossyConfig::new(distance)
-                        .encode(rgba.as_raw(), width, height, PixelLayout::Rgba8)
-                        .map_err(|e| format!("Failed to encode lossy JXL: {}", e))?
-                } else {
+                (8, false) => {
+                    let conversion_started = Instant::now();
                     let rgb = image.to_rgb8();
-                    LossyConfig::new(distance)
-                        .encode(rgb.as_raw(), width, height, PixelLayout::Rgb8)
-                        .map_err(|e| format!("Failed to encode lossy JXL: {}", e))?
+                    log::info!(
+                        "JXL export stage pixel-conversion depth=8 channels=3 took {:?}",
+                        conversion_started.elapsed()
+                    );
+                    encode_jxl_pixels(
+                        rgb.as_raw(),
+                        width,
+                        height,
+                        PixelLayout::Rgb8,
+                        jpeg_quality,
+                        jxl_effort,
+                        jxl_exif_tiff,
+                    )?
+                }
+                (16, has_alpha) => {
+                    let quantize_started = Instant::now();
+                    let samples = quantize_image_to_jxl_u16(image, has_alpha)?;
+                    log::info!(
+                        "JXL export stage quantize depth=16 channels={} took {:?}",
+                        if has_alpha { 4 } else { 3 },
+                        quantize_started.elapsed()
+                    );
+                    // jxl-encoder's RGB16/RGBA16 layouts explicitly consume
+                    // native-endian u16 samples. Casting this u16 allocation
+                    // therefore supplies the required host-native byte order
+                    // without an additional full-image buffer.
+                    let pixels: &[u8] = bytemuck::cast_slice(&samples);
+                    let layout = if has_alpha {
+                        PixelLayout::Rgba16
+                    } else {
+                        PixelLayout::Rgb16
+                    };
+                    encode_jxl_pixels(
+                        pixels,
+                        width,
+                        height,
+                        layout,
+                        jpeg_quality,
+                        jxl_effort,
+                        jxl_exif_tiff,
+                    )?
+                }
+                (other, _) => {
+                    return Err(format!(
+                        "Unsupported JXL bit depth {other}; expected 8 or 16"
+                    ));
                 }
             };
 
@@ -538,6 +1287,7 @@ fn export_masks_for_image(
     export_settings: &ExportSettings,
     output_path_obj: &std::path::Path,
     source_path_str: &str,
+    source_sidecar_path: &Path,
     context: &Arc<GpuContext>,
     state: &tauri::State<AppState>,
     is_raw: bool,
@@ -587,19 +1337,37 @@ fn export_masks_for_image(
             let full_white_mask = ImageBuffer::from_fn(img_w, img_h, |_, _| Luma([255u8]));
             let single_bitmaps: Vec<ImageBuffer<Luma<u8>, Vec<u8>>> = vec![full_white_mask];
 
-            let processed = process_and_get_dynamic_image(
-                context,
-                state,
-                transformed_image.as_ref(),
-                unique_hash,
-                RenderRequest {
-                    adjustments: single_adjustments,
-                    mask_bitmaps: &single_bitmaps,
-                    lut: lut.clone(),
-                    roi: None,
-                },
-                "export_mask_image",
-            )?;
+            let request = RenderRequest {
+                adjustments: single_adjustments,
+                mask_bitmaps: &single_bitmaps,
+                lut: lut.clone(),
+                roi: None,
+            };
+            let processed =
+                if extension.eq_ignore_ascii_case("jxl") && export_settings.jxl_bit_depth == 16 {
+                    process_and_get_high_precision_dynamic_image(
+                        context,
+                        state,
+                        transformed_image.as_ref(),
+                        unique_hash,
+                        request,
+                        "export_mask_image",
+                    )?
+                } else {
+                    process_and_get_dynamic_image(
+                        context,
+                        state,
+                        transformed_image.as_ref(),
+                        unique_hash,
+                        request,
+                        "export_mask_image",
+                    )?
+                };
+            let processed = if extension.eq_ignore_ascii_case("jxl") {
+                normalize_jxl_alpha_semantics(processed, !is_raw && base_image.color().has_alpha())
+            } else {
+                processed
+            };
 
             let with_options = apply_export_resize_and_watermark(processed, export_settings)?;
             let (out_w, out_h) = with_options.dimensions();
@@ -619,6 +1387,7 @@ fn export_masks_for_image(
                 &with_options,
                 &mask_image_path,
                 source_path_str,
+                Some(source_sidecar_path),
                 export_settings,
             )?;
 
@@ -728,20 +1497,26 @@ pub async fn export_images(
     let mut sys = sysinfo::System::new();
     sys.refresh_memory();
 
-    let available_ram_gb = sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
-
-    let ram_based_limit = (available_ram_gb / 2.5).floor() as usize;
-
-    let num_threads = if paths.len() == 1 {
-        1
-    } else {
-        available_cores.min(ram_based_limit).clamp(1, 16)
-    };
+    let available_memory = sys.available_memory();
+    let available_ram_gb = available_memory as f64 / GIB as f64;
+    let jxl16 = output_format.eq_ignore_ascii_case("jxl") && export_settings.jxl_bit_depth == 16;
+    let (largest_pixels, used_dimension_fallback) = largest_export_pixel_count(&paths, jxl16);
+    let (num_threads, estimated_task_bytes, memory_budget) = memory_limited_export_threads(
+        paths.len(),
+        available_cores,
+        available_memory,
+        largest_pixels,
+        jxl16,
+    )?;
 
     log::info!(
-        "Batch Export: {} cores, {:.1} GB free RAM -> {} threads",
+        "Batch Export: {} cores, {:.1} GiB free, {:.1} MP max input, {:.1} GiB/task estimate, {:.1} GiB safe budget, dimension_fallback={} -> {} threads",
         available_cores,
         available_ram_gb,
+        largest_pixels as f64 / 1_000_000.0,
+        estimated_task_bytes as f64 / GIB as f64,
+        memory_budget as f64 / GIB as f64,
+        used_dimension_fallback,
         num_threads
     );
 
@@ -799,16 +1574,6 @@ pub async fn export_images(
             let settings = settings.clone();
 
             let handle = tokio::task::spawn_blocking(move || {
-                if app_handle_clone
-                    .state::<AppState>()
-                    .export_task_handle
-                    .lock()
-                    .unwrap()
-                    .is_none()
-                {
-                    return Err("Export cancelled".to_string());
-                }
-
                 let state = app_handle_clone.state::<AppState>();
                 let (source_path, sidecar_path) = parse_virtual_path(&image_path_str);
                 let source_path_str = source_path.to_string_lossy().to_string();
@@ -940,7 +1705,6 @@ pub async fn export_images(
                             }
                         }
                     };
-
                     let mut main_export_adjustments = js_adjustments.clone();
                     if export_settings.export_masks
                         && let Some(obj) = main_export_adjustments.as_object_mut()
@@ -956,12 +1720,15 @@ pub async fn export_images(
                         &context_clone,
                         &state,
                         is_raw,
+                        extension == "jxl",
+                        extension == "jxl" && export_settings.jxl_bit_depth == 16,
                         &app_handle_clone,
                     )?;
                     save_image_with_metadata(
                         &final_image,
                         &output_path,
                         &source_path_str,
+                        Some(&sidecar_path),
                         &export_settings,
                     )?;
 
@@ -976,6 +1743,7 @@ pub async fn export_images(
                             &export_settings,
                             &output_path,
                             &source_path_str,
+                            &sidecar_path,
                             &context_clone,
                             &state,
                             is_raw,
@@ -1166,24 +1934,48 @@ pub async fn estimate_export_sizes(
         let unique_hash =
             calculate_full_job_hash(&loaded_image.path, &adjustments_clone).wrapping_add(1);
 
-        let processed_preview = process_and_get_dynamic_image(
-            &context,
-            &state,
-            &preview_image,
-            unique_hash,
-            RenderRequest {
-                adjustments: all_adjustments,
-                mask_bitmaps: &mask_bitmaps,
-                lut,
-                roi: None,
-            },
-            "estimate_export_size",
-        )?;
+        let request = RenderRequest {
+            adjustments: all_adjustments,
+            mask_bitmaps: &mask_bitmaps,
+            lut,
+            roi: None,
+        };
+        let processed_preview =
+            if output_format.eq_ignore_ascii_case("jxl") && export_settings.jxl_bit_depth == 16 {
+                process_and_get_high_precision_dynamic_image(
+                    &context,
+                    &state,
+                    &preview_image,
+                    unique_hash,
+                    request,
+                    "estimate_export_size",
+                )?
+            } else {
+                process_and_get_dynamic_image(
+                    &context,
+                    &state,
+                    &preview_image,
+                    unique_hash,
+                    request,
+                    "estimate_export_size",
+                )?
+            };
+        let processed_preview = if output_format.eq_ignore_ascii_case("jxl") {
+            normalize_jxl_alpha_semantics(
+                processed_preview,
+                !is_raw && loaded_image.image.color().has_alpha(),
+            )
+        } else {
+            processed_preview
+        };
 
         let preview_bytes = encode_image_to_bytes(
             &processed_preview,
             &output_format,
             export_settings.jpeg_quality,
+            export_settings.jxl_bit_depth,
+            export_settings.jxl_effort,
+            None,
         )?;
         let preview_byte_size = preview_bytes.len();
 
@@ -1304,24 +2096,48 @@ pub async fn estimate_export_sizes(
         let unique_hash =
             calculate_full_job_hash(&source_path_str, &js_adjustments).wrapping_add(1);
 
-        let processed_preview = process_and_get_dynamic_image(
-            &context,
-            &state,
-            &preview_base,
-            unique_hash,
-            RenderRequest {
-                adjustments: all_adjustments,
-                mask_bitmaps: &mask_bitmaps,
-                lut,
-                roi: None,
-            },
-            "estimate_batch_export_size",
-        )?;
+        let request = RenderRequest {
+            adjustments: all_adjustments,
+            mask_bitmaps: &mask_bitmaps,
+            lut,
+            roi: None,
+        };
+        let processed_preview =
+            if output_format.eq_ignore_ascii_case("jxl") && export_settings.jxl_bit_depth == 16 {
+                process_and_get_high_precision_dynamic_image(
+                    &context,
+                    &state,
+                    &preview_base,
+                    unique_hash,
+                    request,
+                    "estimate_batch_export_size",
+                )?
+            } else {
+                process_and_get_dynamic_image(
+                    &context,
+                    &state,
+                    &preview_base,
+                    unique_hash,
+                    request,
+                    "estimate_batch_export_size",
+                )?
+            };
+        let processed_preview = if output_format.eq_ignore_ascii_case("jxl") {
+            normalize_jxl_alpha_semantics(
+                processed_preview,
+                !is_raw && original_image.color().has_alpha(),
+            )
+        } else {
+            processed_preview
+        };
 
         let preview_bytes = encode_image_to_bytes(
             &processed_preview,
             &output_format,
             export_settings.jpeg_quality,
+            export_settings.jxl_bit_depth,
+            export_settings.jxl_effort,
+            None,
         )?;
         let single_image_estimated_size = preview_bytes.len();
 
@@ -1346,4 +2162,368 @@ pub async fn estimate_export_sizes(
     };
 
     Ok(single_image_extrapolated_size * paths.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{Rgb, RgbImage, Rgba, RgbaImage};
+    use jxl_oxide::JxlImage;
+
+    fn decode_jxl(bytes: &[u8]) -> JxlImage {
+        JxlImage::builder()
+            .read(Cursor::new(bytes))
+            .expect("synthetic JXL should decode")
+    }
+
+    fn decoded_u16(image: &JxlImage, max: f32) -> Vec<u16> {
+        image
+            .render_frame(0)
+            .expect("frame should render")
+            .image_all_channels()
+            .buf()
+            .iter()
+            .map(|sample| (sample.clamp(0.0, 1.0) * max).round() as u16)
+            .collect()
+    }
+
+    fn assert_jxl_contract(image: &JxlImage, width: u32, height: u32, depth: u32, channels: usize) {
+        assert_eq!(image.width(), width);
+        assert_eq!(image.height(), height);
+        assert_eq!(
+            image.image_header().metadata.bit_depth.bits_per_sample(),
+            depth
+        );
+        assert_eq!(image.image_header().metadata.orientation, 1);
+        assert_eq!(image.pixel_format().channels(), channels);
+    }
+
+    #[test]
+    fn old_export_settings_default_jxl_fields() {
+        let settings: ExportSettings = serde_json::from_value(serde_json::json!({
+            "jpegQuality": 90,
+            "resize": null,
+            "keepMetadata": false,
+            "stripGps": true,
+            "filenameTemplate": null,
+            "watermark": null
+        }))
+        .expect("old settings should remain readable");
+
+        assert_eq!(settings.jxl_bit_depth, 8);
+        assert_eq!(settings.jxl_effort, 5);
+    }
+
+    #[test]
+    fn jxl16_memory_budget_scales_with_large_pixel_counts() {
+        let twelve_gib_free = 12 * GIB;
+        let (threads, task_bytes, safe_budget) =
+            memory_limited_export_threads(8, 8, twelve_gib_free, 100_000_000, true)
+                .expect("100 MP should be admitted as one task with 12 GiB free");
+        assert_eq!(threads, 1);
+        assert!(task_bytes > 7 * GIB);
+        assert_eq!(safe_budget, twelve_gib_free * 85 / 100);
+
+        let error = memory_limited_export_threads(8, 8, twelve_gib_free, 200_000_000, true)
+            .expect_err("200 MP must fail before allocation when it exceeds the safe budget");
+        assert!(error.contains("200.0 MP"));
+    }
+
+    #[test]
+    fn jxl16_memory_budget_allows_bounded_parallelism_when_headroom_exists() {
+        let (threads, _, _) =
+            memory_limited_export_threads(8, 8, 24 * GIB, 100_000_000, true).unwrap();
+        assert_eq!(threads, 2);
+    }
+
+    #[test]
+    fn standard_export_keeps_the_existing_minimum_task_budget() {
+        assert_eq!(
+            estimated_export_task_bytes(1_000_000, false),
+            MIN_EXPORT_TASK_BYTES
+        );
+    }
+
+    #[test]
+    fn sixteen_bit_quantization_clamps_rounds_and_rejects_non_finite() {
+        assert_eq!(quantize_unit_f32_to_u16(-0.25).unwrap(), 0);
+        assert_eq!(quantize_unit_f32_to_u16(0.0).unwrap(), 0);
+        assert_eq!(quantize_unit_f32_to_u16(0.5).unwrap(), 32768);
+        assert_eq!(quantize_unit_f32_to_u16(1.0).unwrap(), u16::MAX);
+        assert_eq!(quantize_unit_f32_to_u16(1.25).unwrap(), u16::MAX);
+        assert!(quantize_unit_f32_to_u16(f32::NAN).is_err());
+        assert!(quantize_unit_f32_to_u16(f32::INFINITY).is_err());
+        assert!(quantize_unit_f32_to_u16(f32::NEG_INFINITY).is_err());
+    }
+
+    #[test]
+    fn lossless_rgb8_jxl_roundtrip_is_pixel_exact() {
+        let pixels = vec![0, 1, 2, 17, 128, 254, 255, 33, 99, 8, 7, 6];
+        let image = DynamicImage::ImageRgb8(
+            RgbImage::from_raw(2, 2, pixels.clone()).expect("valid RGB8 fixture"),
+        );
+
+        let encoded = encode_image_to_bytes(&image, "jxl", 100, 8, 5, None).unwrap();
+        let decoded = decode_jxl(&encoded);
+        assert_jxl_contract(&decoded, 2, 2, 8, 3);
+        let actual: Vec<u8> = decoded_u16(&decoded, u8::MAX as f32)
+            .into_iter()
+            .map(|sample| sample as u8)
+            .collect();
+        assert_eq!(actual, pixels);
+        verify_jxl_export(&encoded, 2, 2, 8, 3, false, true, None).unwrap();
+    }
+
+    #[test]
+    fn jxl_exif_is_embedded_during_encoding_and_roundtrips() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing_source = temp.path().join("missing-source.jpg");
+        let rendered = exif_processing::RenderedImageMetadata {
+            width: 2,
+            height: 2,
+            bits_per_sample: 16,
+            samples_per_pixel: 3,
+        };
+        let exif_tiff = exif_processing::build_jxl_exif_tiff(
+            missing_source.to_str().unwrap(),
+            None,
+            true,
+            rendered,
+        )
+        .unwrap();
+        let image =
+            DynamicImage::ImageRgb32F(ImageBuffer::from_pixel(2, 2, Rgb([0.125, 0.5, 0.875])));
+
+        let encoded = encode_image_to_bytes(&image, "jxl", 100, 16, 5, Some(&exif_tiff)).unwrap();
+        verify_jxl_export(&encoded, 2, 2, 16, 3, true, true, Some(&exif_tiff)).unwrap();
+    }
+
+    #[test]
+    fn jxl_exif_verification_reads_the_complete_trailing_box() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing_source = temp.path().join("missing-source.jpg");
+        let rendered = exif_processing::RenderedImageMetadata {
+            width: 128,
+            height: 128,
+            bits_per_sample: 8,
+            samples_per_pixel: 3,
+        };
+        let expected_exif = exif_processing::build_jxl_exif_tiff(
+            missing_source.to_str().unwrap(),
+            None,
+            true,
+            rendered,
+        )
+        .unwrap();
+        let mut padded_exif = expected_exif.clone();
+        padded_exif.extend_from_slice(&vec![0; 8 * 1024]);
+        let image = DynamicImage::ImageRgb8(RgbImage::from_fn(128, 128, |x, y| {
+            Rgb([
+                (x.wrapping_mul(17) ^ y.wrapping_mul(31)) as u8,
+                (x.wrapping_mul(11).wrapping_add(y.wrapping_mul(23))) as u8,
+                (x.wrapping_mul(29) ^ y.wrapping_mul(7)) as u8,
+            ])
+        }));
+
+        let encoded = encode_image_to_bytes(&image, "jxl", 99, 8, 4, Some(&padded_exif)).unwrap();
+        let extracted = extract_jxl_exif_tiff(&encoded)
+            .unwrap()
+            .expect("the complete Exif box should be found");
+        assert_eq!(extracted, padded_exif);
+
+        // jxl-oxide 0.12 stops reading once the image codestream completes, so
+        // a large trailing Exif box is finalized from only the bytes already in
+        // its 4 KiB input buffer. This documents the decoder behavior that
+        // caused real exports to fail with `Truncated field value`.
+        let decoder_view = decode_jxl(&encoded);
+        let decoder_exif_len = match decoder_view.aux_boxes().first_exif().unwrap() {
+            jxl_oxide::AuxBoxData::Data(raw) => raw.payload().len(),
+            other => panic!("expected decoder Exif data, got {other:?}"),
+        };
+        assert!(decoder_exif_len < padded_exif.len());
+
+        verify_jxl_export(&encoded, 128, 128, 8, 3, true, true, Some(&expected_exif)).unwrap();
+    }
+
+    #[test]
+    fn jxl_exif_verification_accepts_byte_different_semantic_match() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing_source = temp.path().join("missing-source.jpg");
+        let rendered = exif_processing::RenderedImageMetadata {
+            width: 2,
+            height: 2,
+            bits_per_sample: 16,
+            samples_per_pixel: 3,
+        };
+        let expected_exif = exif_processing::build_jxl_exif_tiff(
+            missing_source.to_str().unwrap(),
+            None,
+            true,
+            rendered,
+        )
+        .unwrap();
+        let mut padded_exif = expected_exif.clone();
+        padded_exif.extend_from_slice(&[0; 16]);
+        let image =
+            DynamicImage::ImageRgb32F(ImageBuffer::from_pixel(2, 2, Rgb([0.125, 0.5, 0.875])));
+
+        let encoded = encode_image_to_bytes(&image, "jxl", 100, 16, 5, Some(&padded_exif)).unwrap();
+        verify_jxl_export(&encoded, 2, 2, 16, 3, true, true, Some(&expected_exif)).unwrap();
+    }
+
+    #[test]
+    fn jxl_exif_verification_rejects_extra_semantic_tag() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing_source = temp.path().join("missing-source.jpg");
+        let rendered = exif_processing::RenderedImageMetadata {
+            width: 2,
+            height: 2,
+            bits_per_sample: 8,
+            samples_per_pixel: 3,
+        };
+        let expected_exif = exif_processing::build_jxl_exif_tiff(
+            missing_source.to_str().unwrap(),
+            None,
+            true,
+            rendered,
+        )
+        .unwrap();
+
+        let mut sidecar = crate::image_processing::ImageMetadata::default();
+        sidecar.exif = Some(HashMap::from([(
+            "Make".to_string(),
+            "Unexpected Camera".to_string(),
+        )]));
+        fs::write(
+            exif_processing::get_primary_sidecar_path(&missing_source),
+            serde_json::to_vec(&sidecar).unwrap(),
+        )
+        .unwrap();
+        let actual_exif = exif_processing::build_jxl_exif_tiff(
+            missing_source.to_str().unwrap(),
+            None,
+            true,
+            rendered,
+        )
+        .unwrap();
+        let image = DynamicImage::new_rgb8(2, 2);
+        let encoded = encode_image_to_bytes(&image, "jxl", 100, 8, 5, Some(&actual_exif)).unwrap();
+
+        let error =
+            verify_jxl_export(&encoded, 2, 2, 8, 3, true, true, Some(&expected_exif)).unwrap_err();
+        assert!(error.contains("semantic verification failed"));
+    }
+
+    #[test]
+    fn lossless_rgb16_jxl_preserves_sub_eight_bit_precision() {
+        let expected = vec![
+            1000u16, 1001, 1002, 32767, 32768, 32769, 65000, 65001, 65002, 0, 1, 65535,
+        ];
+        assert_eq!(expected[0] / 257, expected[1] / 257);
+        let pixels: Vec<f32> = expected
+            .iter()
+            .map(|sample| *sample as f32 / u16::MAX as f32)
+            .collect();
+        let image = DynamicImage::ImageRgb32F(
+            ImageBuffer::<Rgb<f32>, _>::from_raw(2, 2, pixels)
+                .expect("valid high precision fixture"),
+        );
+
+        let encoded = encode_image_to_bytes(&image, "jxl", 100, 16, 5, None).unwrap();
+        let decoded = decode_jxl(&encoded);
+        assert_jxl_contract(&decoded, 2, 2, 16, 3);
+        assert_eq!(decoded_u16(&decoded, u16::MAX as f32), expected);
+    }
+
+    #[test]
+    fn opaque_rgba_semantics_are_preserved_at_both_depths() {
+        let image = DynamicImage::ImageRgba32F(
+            ImageBuffer::<Rgba<f32>, _>::from_raw(
+                2,
+                1,
+                vec![0.1, 0.2, 0.3, 1.0, 0.4, 0.5, 0.6, 1.0],
+            )
+            .unwrap(),
+        );
+
+        for depth in [8, 16] {
+            let encoded = encode_image_to_bytes(&image, "jxl", 100, depth, 5, None).unwrap();
+            let decoded = decode_jxl(&encoded);
+            assert_jxl_contract(&decoded, 2, 1, u32::from(depth), 4);
+        }
+    }
+
+    #[test]
+    fn lossy_eight_and_sixteen_bit_jxl_decode_with_declared_contract() {
+        let values: Vec<f32> = (0..16 * 16 * 3)
+            .map(|index| ((index * 37) % 65536) as f32 / u16::MAX as f32)
+            .collect();
+        let image = DynamicImage::ImageRgb32F(
+            ImageBuffer::<Rgb<f32>, _>::from_raw(16, 16, values).unwrap(),
+        );
+
+        for depth in [8, 16] {
+            let encoded = encode_image_to_bytes(&image, "jxl", 92, depth, 5, None).unwrap();
+            let decoded = decode_jxl(&encoded);
+            assert_jxl_contract(&decoded, 16, 16, u32::from(depth), 3);
+            decoded
+                .render_frame(0)
+                .expect("lossy frame should fully decode");
+        }
+    }
+
+    #[test]
+    fn lossy_jxl_rejects_unsupported_effort() {
+        let image = DynamicImage::new_rgb8(2, 2);
+        let error = encode_image_to_bytes(&image, "jxl", 92, 8, 6, None).unwrap_err();
+        assert!(error.contains("expected 4, 5, or 7"));
+    }
+
+    #[test]
+    fn sixteen_bit_export_rejects_non_finite_render_output() {
+        let image = DynamicImage::ImageRgb32F(
+            ImageBuffer::<Rgb<f32>, _>::from_raw(1, 1, vec![0.0, f32::NAN, 1.0]).unwrap(),
+        );
+
+        let error = encode_image_to_bytes(&image, "jxl", 100, 16, 5, None).unwrap_err();
+        assert!(error.contains("non-finite"));
+    }
+
+    #[test]
+    fn watermark_blending_keeps_high_precision_base_pixels() {
+        let temp = tempfile::Builder::new()
+            .suffix(".png")
+            .tempfile()
+            .expect("create watermark fixture");
+        RgbaImage::from_pixel(1, 1, Rgba([200, 100, 50, 128]))
+            .save(temp.path())
+            .expect("write watermark fixture");
+
+        let mut image = DynamicImage::ImageRgb32F(ImageBuffer::from_pixel(
+            4,
+            4,
+            Rgb([0.12345, 0.23456, 0.34567]),
+        ));
+        apply_watermark(
+            &mut image,
+            &WatermarkSettings {
+                path: temp.path().to_string_lossy().into_owned(),
+                anchor: WatermarkAnchor::TopLeft,
+                scale: 25.0,
+                spacing: 0.0,
+                opacity: 100.0,
+            },
+        )
+        .unwrap();
+
+        let DynamicImage::ImageRgb32F(buffer) = image else {
+            panic!("watermarking must retain the high precision image variant");
+        };
+        assert_eq!(buffer.get_pixel(1, 1).0, [0.12345, 0.23456, 0.34567]);
+        assert_ne!(
+            buffer.get_pixel(0, 0)[0],
+            (buffer.get_pixel(0, 0)[0] * 255.0).round() / 255.0,
+            "blended pixel should not be pre-quantized to eight bits"
+        );
+    }
 }

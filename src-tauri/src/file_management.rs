@@ -377,6 +377,21 @@ pub async fn update_exif_fields(
 
             let mut final_metadata = crate::exif_processing::load_sidecar(&primary_path);
 
+            let explicit_overrides = final_metadata
+                .exif_overrides
+                .get_or_insert_with(HashMap::new);
+            for (key, value) in &updates {
+                let trimmed = value.trim();
+                explicit_overrides.insert(
+                    key.clone(),
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    },
+                );
+            }
+
             final_metadata.exif = Some(exif_data);
             if let Ok(json) = serde_json::to_string_pretty(&final_metadata) {
                 let _ = std::fs::write(&primary_path, json);
