@@ -4,7 +4,7 @@ use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use image::codecs::jpeg::JpegEncoder;
 use image::{DynamicImage, GenericImageView, GrayImage, ImageBuffer, ImageFormat, Luma, imageops};
@@ -271,6 +271,14 @@ fn apply_export_resize_and_watermark(
         apply_watermark(&mut image, watermark_settings)?;
     }
     Ok(image)
+}
+
+fn ensure_export_not_cancelled(cancellation_token: &AtomicBool) -> Result<(), String> {
+    if cancellation_token.load(Ordering::SeqCst) {
+        Err("Export cancelled".to_string())
+    } else {
+        Ok(())
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -733,10 +741,14 @@ pub async fn export_images(
     if state.export_task_handle.lock().unwrap().is_some() {
         return Err("An export is already in progress.".to_string());
     }
+    state
+        .export_cancellation_token
+        .store(false, Ordering::SeqCst);
 
     let context = get_or_init_gpu_context(&state, &app_handle)?;
     let context = Arc::new(context);
     let progress_counter = Arc::new(AtomicUsize::new(0));
+    let cancellation_token = Arc::clone(&state.export_cancellation_token);
 
     let available_cores = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -805,7 +817,14 @@ pub async fn export_images(
         let mut join_handles = Vec::new();
 
         for (global_index, image_path_str, appearance_count, explicit_vc) in export_items {
+            if cancellation_token.load(Ordering::SeqCst) {
+                break;
+            }
             let permit = semaphore.clone().acquire_owned().await.unwrap();
+            if cancellation_token.load(Ordering::SeqCst) {
+                drop(permit);
+                break;
+            }
 
             let app_handle_clone = app_handle.clone();
             let context_clone = Arc::clone(&context);
@@ -817,17 +836,10 @@ pub async fn export_images(
             let current_edit_path = current_edit_path.clone();
             let current_edit_adjustments = current_edit_adjustments.clone();
             let settings = settings.clone();
+            let cancellation_token_clone = Arc::clone(&cancellation_token);
 
             let handle = tokio::task::spawn_blocking(move || {
-                if app_handle_clone
-                    .state::<AppState>()
-                    .export_task_handle
-                    .lock()
-                    .unwrap()
-                    .is_none()
-                {
-                    return Err("Export cancelled".to_string());
-                }
+                ensure_export_not_cancelled(&cancellation_token_clone)?;
 
                 let state = app_handle_clone.state::<AppState>();
                 let (source_path, sidecar_path) = parse_virtual_path(&image_path_str);
@@ -960,6 +972,7 @@ pub async fn export_images(
                             }
                         }
                     };
+                    ensure_export_not_cancelled(&cancellation_token_clone)?;
 
                     let mut main_export_adjustments = js_adjustments.clone();
                     if export_settings.export_masks
@@ -978,12 +991,14 @@ pub async fn export_images(
                         is_raw,
                         &app_handle_clone,
                     )?;
+                    ensure_export_not_cancelled(&cancellation_token_clone)?;
                     save_image_with_metadata(
                         &final_image,
                         &output_path,
                         &source_path_str,
                         &export_settings,
                     )?;
+                    ensure_export_not_cancelled(&cancellation_token_clone)?;
 
                     if export_settings.preserve_timestamps {
                         set_timestamps_from_exif(Path::new(&source_path_str), &output_path);
@@ -1006,18 +1021,25 @@ pub async fn export_images(
                     Ok(())
                 })();
 
-                let current_progress = progress_counter_clone.fetch_add(1, Ordering::SeqCst) + 1;
-                let _ = app_handle_clone.emit(
-                    "batch-export-progress",
-                    serde_json::json!({
-                        "current": current_progress,
-                        "total": total_paths,
-                        "path": &image_path_str
-                    }),
-                );
+                if !cancellation_token_clone.load(Ordering::SeqCst) {
+                    let current_progress =
+                        progress_counter_clone.fetch_add(1, Ordering::SeqCst) + 1;
+                    let _ = app_handle_clone.emit(
+                        "batch-export-progress",
+                        serde_json::json!({
+                            "current": current_progress,
+                            "total": total_paths,
+                            "path": &image_path_str
+                        }),
+                    );
+                }
 
                 drop(permit);
-                result
+                if cancellation_token_clone.load(Ordering::SeqCst) {
+                    Err("Export cancelled".to_string())
+                } else {
+                    result
+                }
             });
 
             join_handles.push(handle);
@@ -1033,28 +1055,32 @@ pub async fn export_images(
 
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
-        let mut error_count = 0;
-        for result in results {
-            if let Err(e) = result {
-                error_count += 1;
-                log::error!("Export error: {}", e);
-                if total_paths == 1 {
-                    let _ = app_handle.emit("export-error", e);
+        if cancellation_token.load(Ordering::SeqCst) {
+            log::info!("Batch export cancelled and worker cleanup completed");
+        } else {
+            let mut error_count = 0;
+            for result in results {
+                if let Err(e) = result {
+                    error_count += 1;
+                    log::error!("Export error: {}", e);
+                    if total_paths == 1 {
+                        let _ = app_handle.emit("export-error", e);
+                    }
                 }
             }
-        }
 
-        if error_count > 0 && total_paths > 1 {
-            let _ = app_handle.emit(
-                "export-complete-with-errors",
-                serde_json::json!({ "errors": error_count, "total": total_paths }),
-            );
-        } else if error_count == 0 {
-            let _ = app_handle.emit(
-                "batch-export-progress",
-                serde_json::json!({ "current": total_paths, "total": total_paths, "path": "" }),
-            );
-            let _ = app_handle.emit("export-complete", ());
+            if error_count > 0 && total_paths > 1 {
+                let _ = app_handle.emit(
+                    "export-complete-with-errors",
+                    serde_json::json!({ "errors": error_count, "total": total_paths }),
+                );
+            } else if error_count == 0 {
+                let _ = app_handle.emit(
+                    "batch-export-progress",
+                    serde_json::json!({ "current": total_paths, "total": total_paths, "path": "" }),
+                );
+                let _ = app_handle.emit("export-complete", ());
+            }
         }
     });
 
@@ -1063,16 +1089,18 @@ pub async fn export_images(
 }
 
 #[tauri::command]
-pub fn cancel_export(state: tauri::State<AppState>) -> Result<(), String> {
-    match state.export_task_handle.lock().unwrap().take() {
-        Some(handle) => {
-            handle.abort();
-            println!("Export task cancellation requested.");
-        }
-        _ => {
-            return Err("No export task is currently running.".to_string());
-        }
-    }
+pub fn cancel_export(
+    state: tauri::State<AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    let task_is_active = state.export_task_handle.lock().unwrap().is_some();
+    state
+        .export_cancellation_token
+        .store(true, Ordering::SeqCst);
+    let _ = app_handle.emit("export-cancelled", ());
+    log::info!(
+        "Export cancellation requested (active_task={task_is_active}); workers will stop at the next checkpoint"
+    );
     Ok(())
 }
 
@@ -1360,4 +1388,25 @@ pub async fn estimate_export_sizes(
     };
 
     Ok(single_image_extrapolated_size * paths.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn export_cancellation_check_is_idempotent() {
+        let cancellation_token = AtomicBool::new(false);
+        ensure_export_not_cancelled(&cancellation_token).unwrap();
+
+        cancellation_token.store(true, Ordering::SeqCst);
+        assert_eq!(
+            ensure_export_not_cancelled(&cancellation_token).unwrap_err(),
+            "Export cancelled"
+        );
+        assert_eq!(
+            ensure_export_not_cancelled(&cancellation_token).unwrap_err(),
+            "Export cancelled"
+        );
+    }
 }
