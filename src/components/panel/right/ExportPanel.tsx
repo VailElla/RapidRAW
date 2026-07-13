@@ -282,7 +282,8 @@ export default function ExportPanel({
   const isAndroid = osPlatform === 'android';
 
   const { status, progress, errorMessage } = exportState;
-  const isExporting = status === Status.Exporting;
+  const isExporting = [Status.Exporting, Status.Cancelling].includes(status);
+  const isCancelling = status === Status.Cancelling;
   const isLibraryContext = !!onClose;
 
   const pathsToExport = isLibraryContext
@@ -537,10 +538,12 @@ export default function ExportPanel({
   };
 
   const handleCancel = async () => {
+    setExportState({ status: Status.Cancelling });
     try {
       await invoke(Invokes.CancelExport);
     } catch (error) {
       console.error('Failed to cancel:', error);
+      setExportState({ status: Status.Exporting });
     }
   };
 
@@ -565,12 +568,14 @@ export default function ExportPanel({
       <div className="grow overflow-y-auto p-4 space-y-8">
         {canExport ? (
           <>
-            <ExportPresetsList
-              appSettings={appSettings}
-              onSettingsChange={onSettingsChange}
-              currentSettings={currentSettingsObject}
-              onApplyPreset={handleApplyPreset}
-            />
+            <div className={isExporting ? 'opacity-50 pointer-events-none' : ''}>
+              <ExportPresetsList
+                appSettings={appSettings}
+                onSettingsChange={onSettingsChange}
+                currentSettings={currentSettingsObject}
+                onApplyPreset={handleApplyPreset}
+              />
+            </div>
 
             <Section title={t('export.sections.fileSettings')}>
               <div className="grid grid-cols-3 gap-2">
@@ -706,12 +711,14 @@ export default function ExportPanel({
                   />
                   {enableWatermark && (
                     <div className="space-y-4 pl-2 border-l-2 border-surface">
-                      <ImagePicker
-                        label={t('export.watermark.watermarkImage')}
-                        imageName={watermarkPath ? watermarkPath.split(/[\\/]/).pop() || null : null}
-                        onImageSelect={setWatermarkPath}
-                        onClear={() => setWatermarkPath(null)}
-                      />
+                      <div className={isExporting ? 'opacity-50 pointer-events-none' : ''}>
+                        <ImagePicker
+                          label={t('export.watermark.watermarkImage')}
+                          imageName={watermarkPath ? watermarkPath.split(/[\\/]/).pop() || null : null}
+                          onImageSelect={setWatermarkPath}
+                          onClear={() => setWatermarkPath(null)}
+                        />
+                      </div>
                       {watermarkPath && (
                         <>
                           <Dropdown
@@ -777,6 +784,7 @@ export default function ExportPanel({
               <div className="bg-surface rounded-xl overflow-hidden">
                 <button
                   onClick={() => setIsAdvancedExpanded(!isAdvancedExpanded)}
+                  disabled={isExporting}
                   className="w-full flex items-center justify-between p-3.5 hover:bg-card-active transition-colors"
                 >
                   <Text
@@ -865,15 +873,17 @@ export default function ExportPanel({
           className={`group rounded-md h-11 w-full flex items-center text-md font-bold! justify-center ${
             status === Status.Exporting
               ? 'bg-red-600/80 hover:bg-red-600 text-white'
-              : status === Status.Success
-                ? 'bg-green-500/70 text-white shadow-none'
-                : status === Status.Error
-                  ? 'bg-red-500/20 text-red-400 shadow-none'
-                  : status === Status.Cancelled
-                    ? 'bg-yellow-500/20 text-yellow-400 shadow-none'
-                    : ''
+              : status === Status.Cancelling
+                ? 'bg-yellow-500/20 text-yellow-400 shadow-none'
+                : status === Status.Success
+                  ? 'bg-green-500/70 text-white shadow-none'
+                  : status === Status.Error
+                    ? 'bg-red-500/20 text-red-400 shadow-none'
+                    : status === Status.Cancelled
+                      ? 'bg-yellow-500/20 text-yellow-400 shadow-none'
+                      : ''
           }`}
-          disabled={status === Status.Exporting ? false : !canExport}
+          disabled={isCancelling || (status !== Status.Exporting && !canExport)}
           onClick={status === Status.Exporting ? handleCancel : handleExport}
           size="lg"
         >
@@ -889,6 +899,10 @@ export default function ExportPanel({
                 <Ban size={18} className="mr-2" />
                 {t('export.status.cancelExport')}
               </span>
+            </>
+          ) : status === Status.Cancelling ? (
+            <>
+              <Loader size={18} className="animate-spin mr-2" /> {t('export.status.cancelling')}
             </>
           ) : status === Status.Success ? (
             <>

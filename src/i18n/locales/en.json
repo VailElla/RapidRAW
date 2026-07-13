@@ -780,6 +780,7 @@
     "status": {
       "cancelExport": "Cancel Export",
       "cancelled": "Export cancelled",
+      "cancelling": "Cancelling export…",
       "estimatedAverageSize": " ({{size}} avg)",
       "estimatedSize": "Estimated file size: ~{{size}}",
       "estimatedTotalSize": "Estimated total size: ~{{size}}",

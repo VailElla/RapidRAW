@@ -778,6 +778,7 @@
     "status": {
       "cancelExport": "取消导出",
       "cancelled": "导出已取消",
+      "cancelling": "正在取消导出…",
       "estimatedAverageSize": "（平均 {{size}}）",
       "estimatedSize": "预计文件大小：约 {{size}}",
       "estimatedTotalSize": "预计总大小：约 {{size}}",

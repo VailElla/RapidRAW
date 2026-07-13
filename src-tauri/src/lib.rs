@@ -105,7 +105,7 @@ extern "C" fn force_exit(_signal: libc::c_int) {
 #[cfg(target_os = "macos")]
 pub fn register_exit_handler() {
     unsafe {
-        libc::signal(libc::SIGABRT, force_exit as libc::sighandler_t);
+        libc::signal(libc::SIGABRT, force_exit as *const () as libc::sighandler_t);
     }
 }
 
@@ -1873,9 +1873,14 @@ fn frontend_ready(
 
     #[cfg(not(target_os = "android"))]
     {
+        #[cfg(any(windows, target_os = "linux"))]
         let mut should_maximize = false;
+        #[cfg(any(windows, target_os = "linux"))]
         let mut should_fullscreen = false;
+        #[cfg(not(any(windows, target_os = "linux")))]
+        let _ = (&app_handle, is_first_run);
 
+        #[cfg(any(windows, target_os = "linux"))]
         if is_first_run && let Ok(config_dir) = app_handle.path().app_config_dir() {
             let path = config_dir.join("window_state.json");
 
@@ -1924,6 +1929,7 @@ fn frontend_ready(
         if let Err(e) = window.set_focus() {
             log::error!("Failed to focus window: {}", e);
         }
+        #[cfg(any(windows, target_os = "linux"))]
         if is_first_run {
             if should_maximize {
                 let _ = window.maximize();
@@ -2271,7 +2277,7 @@ pub fn run() {
             gpu_processor: Mutex::new(None),
             ai_state: Mutex::new(None),
             ai_init_lock: TokioMutex::new(()),
-            export_task_token: Mutex::new(None),
+            export_task_token: Arc::new(Mutex::new(None)),
             hdr_result: Arc::new(Mutex::new(None)),
             panorama_result: Arc::new(Mutex::new(None)),
             denoise_result: Arc::new(Mutex::new(None)),
@@ -2405,14 +2411,13 @@ pub fn run() {
             match event {
                 #[cfg(target_os = "macos")]
                 tauri::RunEvent::Opened { urls } => {
-                    if let Some(url) = urls.first() {
-                        if let Ok(path) = url.to_file_path() {
-                            if let Some(path_str) = path.to_str() {
-                                let state = app_handle.state::<AppState>();
-                                *state.initial_file_path.lock().unwrap() = Some(path_str.to_string());
-                                log::info!("macOS initial open: Stored path {} for later.", path_str);
-                            }
-                        }
+                    if let Some(url) = urls.first()
+                        && let Ok(path) = url.to_file_path()
+                        && let Some(path_str) = path.to_str()
+                    {
+                        let state = app_handle.state::<AppState>();
+                        *state.initial_file_path.lock().unwrap() = Some(path_str.to_string());
+                        log::info!("macOS initial open: Stored path {} for later.", path_str);
                     }
                 }
                 tauri::RunEvent::ExitRequested { api, .. } => {

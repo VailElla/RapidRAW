@@ -166,6 +166,9 @@ export function useTauriListeners({
             errorMessage: typeof event.payload === 'string' ? event.payload : 'Unknown error',
           });
       }),
+      listen('export-cancelling', () => {
+        if (isEffectActive) useProcessStore.getState().setExportState({ status: Status.Cancelling });
+      }),
       listen('export-cancelled', () => {
         if (isEffectActive) useProcessStore.getState().setExportState({ status: Status.Cancelled });
       }),

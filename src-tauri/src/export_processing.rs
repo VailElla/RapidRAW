@@ -288,6 +288,35 @@ enum ExportCancellationRequest {
     NoActiveTask,
 }
 
+struct ExportTaskGuard {
+    task_token: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    cancellation_token: Arc<AtomicBool>,
+    app_handle: Option<tauri::AppHandle>,
+}
+
+impl ExportTaskGuard {
+    fn new(
+        task_token: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+        cancellation_token: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            task_token,
+            cancellation_token,
+            app_handle: None,
+        }
+    }
+
+    fn with_app_handle(
+        task_token: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+        cancellation_token: Arc<AtomicBool>,
+        app_handle: tauri::AppHandle,
+    ) -> Self {
+        let mut guard = Self::new(task_token, cancellation_token);
+        guard.app_handle = Some(app_handle);
+        guard
+    }
+}
+
 fn register_export_task(
     task_token: &Mutex<Option<Arc<AtomicBool>>>,
 ) -> Result<Arc<AtomicBool>, String> {
@@ -340,11 +369,32 @@ where
     }
 
     let cancelled = cancellation_token.load(Ordering::SeqCst);
-    // Emit the terminal event before releasing the task slot. This serializes
-    // completion against both cancellation and the next export registration.
-    on_finish(cancelled);
     *active_token = None;
+
+    // Keep the mutex held while notifying the UI. The task slot is logically
+    // free, but a new export cannot register until the terminal event has
+    // been serialized, preventing the old event from racing with new UI state.
+    on_finish(cancelled);
     true
+}
+
+impl Drop for ExportTaskGuard {
+    fn drop(&mut self) {
+        let app_handle = self.app_handle.clone();
+        let _ = finish_export_task(
+            &self.task_token,
+            &self.cancellation_token,
+            |cancelled| match (cancelled, app_handle) {
+                (true, Some(app_handle)) => {
+                    let _ = app_handle.emit("export-cancelled", ());
+                }
+                (false, Some(app_handle)) => {
+                    let _ = app_handle.emit("export-error", "Export task terminated unexpectedly");
+                }
+                _ => {}
+            },
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -802,28 +852,24 @@ pub async fn export_images(
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
     let cancellation_token = register_export_task(&state.export_task_token)?;
+    let task_guard = ExportTaskGuard::with_app_handle(
+        Arc::clone(&state.export_task_token),
+        Arc::clone(&cancellation_token),
+        app_handle.clone(),
+    );
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
     if cancellation_token.load(Ordering::SeqCst) {
-        finish_export_task(&state.export_task_token, &cancellation_token, |_| {});
         return Ok(());
     }
 
     let context = match get_or_init_gpu_context(&state, &app_handle) {
         Ok(context) => context,
-        Err(error) => {
-            let mut cancelled = false;
-            finish_export_task(
-                &state.export_task_token,
-                &cancellation_token,
-                |was_cancelled| cancelled = was_cancelled,
-            );
-            return if cancelled { Ok(()) } else { Err(error) };
-        }
+        Err(_) if cancellation_token.load(Ordering::SeqCst) => return Ok(()),
+        Err(error) => return Err(error),
     };
 
     if cancellation_token.load(Ordering::SeqCst) {
-        finish_export_task(&state.export_task_token, &cancellation_token, |_| {});
         return Ok(());
     }
 
@@ -855,6 +901,7 @@ pub async fn export_images(
     );
 
     let _export_task = tokio::spawn(async move {
+        let _task_guard = task_guard;
         let output_folder_path = std::path::Path::new(&output_folder_or_file);
         let total_paths = paths.len();
         let settings = load_settings(app_handle.clone()).unwrap_or_default();
@@ -1146,6 +1193,7 @@ pub async fn export_images(
             |cancelled| {
                 if cancelled {
                     log::info!("Batch export cancelled and worker cleanup completed");
+                    let _ = app_handle.emit("export-cancelled", ());
                     return;
                 }
 
@@ -1185,7 +1233,7 @@ pub fn cancel_export(
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
     match request_export_cancellation(&state.export_task_token, || {
-        let _ = app_handle.emit("export-cancelled", ());
+        let _ = app_handle.emit("export-cancelling", ());
     }) {
         ExportCancellationRequest::Requested => {
             log::info!("Export cancellation requested; workers will stop at the next checkpoint");
@@ -1194,7 +1242,7 @@ pub fn cancel_export(
             log::info!("Export cancellation was already requested");
         }
         ExportCancellationRequest::NoActiveTask => {
-            log::info!("Ignoring export cancellation because no export is active");
+            return Err("No export task is currently running.".to_string());
         }
     }
     Ok(())
@@ -1544,15 +1592,19 @@ mod tests {
         let cancellation_token = register_export_task(&task_token).unwrap();
         let completed_count = AtomicUsize::new(0);
         let cancelled_count = AtomicUsize::new(0);
+        let callback_invoked = AtomicBool::new(false);
 
         assert!(finish_export_task(
             &task_token,
             &cancellation_token,
             |cancelled| {
                 assert!(!cancelled);
+                callback_invoked.store(true, Ordering::SeqCst);
                 completed_count.fetch_add(1, Ordering::SeqCst);
             },
         ));
+        assert!(callback_invoked.load(Ordering::SeqCst));
+        assert!(task_token.lock().unwrap().is_none());
         assert_eq!(
             request_export_cancellation(&task_token, || {
                 cancelled_count.fetch_add(1, Ordering::SeqCst);

@@ -824,6 +824,7 @@
     "status": {
       "cancelExport": "Отменить экспорт",
       "cancelled": "Экспорт отменен",
+      "cancelling": "Отмена экспорта…",
       "estimatedAverageSize": " (~{{size}} в среднем)",
       "estimatedSize": "Оценочный размер файла: ~{{size}}",
       "estimatedTotalSize": "Оценочный общий размер: ~{{size}}",

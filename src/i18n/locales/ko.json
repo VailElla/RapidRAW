@@ -778,6 +778,7 @@
     "status": {
       "cancelExport": "내보내기 취소",
       "cancelled": "내보내기가 취소되었습니다",
+      "cancelling": "내보내기 취소 중…",
       "estimatedAverageSize": " ({{size}} 평균)",
       "estimatedSize": "예상 파일 크기: ~{{size}}",
       "estimatedTotalSize": "예상 총 크기: ~{{size}}",

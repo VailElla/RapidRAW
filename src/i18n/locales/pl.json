@@ -824,6 +824,7 @@
     "status": {
       "cancelExport": "Anuluj eksport",
       "cancelled": "Eksport anulowany",
+      "cancelling": "Anulowanie eksportu…",
       "estimatedAverageSize": " (śr. {{size}})",
       "estimatedSize": "Szacowany rozmiar pliku: ~{{size}}",
       "estimatedTotalSize": "Szacowany rozmiar całkowity: ~{{size}}",
