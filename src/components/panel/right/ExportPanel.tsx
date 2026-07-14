@@ -538,12 +538,16 @@ export default function ExportPanel({
   };
 
   const handleCancel = async () => {
-    setExportState({ status: Status.Cancelling });
+    setExportState((current: ExportState) =>
+      current.status === Status.Exporting ? { status: Status.Cancelling } : {},
+    );
     try {
       await invoke(Invokes.CancelExport);
     } catch (error) {
       console.error('Failed to cancel:', error);
-      setExportState({ status: Status.Exporting });
+      setExportState((current: ExportState) =>
+        current.status === Status.Cancelling ? { status: Status.Exporting } : {},
+      );
     }
   };
 
