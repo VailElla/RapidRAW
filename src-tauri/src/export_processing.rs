@@ -1182,8 +1182,6 @@ pub async fn export_images(
             }
         }
 
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-
         let errors: Vec<String> = results.into_iter().filter_map(Result::err).collect();
         let error_count = errors.len();
         let export_state = app_handle.state::<AppState>();
